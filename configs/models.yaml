@@ -1,0 +1,31 @@
+# Список моделей сервиса. Сейчас один элемент, при масштабировании до 7
+# моделей просто дописываются новые элементы списка - код (loader/registry)
+# не меняется.
+models:
+  - name: "cc"
+    artifacts_dir: "artifacts/cc"
+    weights_file: "model.pth"
+    schema_file: "schema.json"
+    calibrators_file: "calibrators.json"
+    freq_encoding_file: "freq_encoding.parquet"
+
+inference:
+  device: "cuda"
+  infer_batch_size: 16
+  chunk_size: 100000
+
+# Значения S3 берутся из глобальных переменных окружения (пробрасываются
+# Helm-ом в Deployment env). Здесь указываем не сами значения, а ИМЕНА
+# переменных окружения, откуда их нужно читать.
+s3:
+  endpoint_url_env: "S3_ENDPOINT_URL"
+  access_key_env: "S3_ACCESS_KEY"
+  secret_key_env: "S3_SECRET_KEY"
+  bucket_in_env: "S3_BUCKET_IN"
+  bucket_out_env: "S3_BUCKET_OUT"
+  region_env: "S3_REGION"
+  use_ssl_env: "S3_USE_SSL"
+  verify_ssl_env: "S3_VERIFY_SSL"
+
+task:
+  progress_update_interval_sec: 10

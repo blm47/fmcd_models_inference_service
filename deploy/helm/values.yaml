@@ -1,0 +1,52 @@
+image:
+  repository: registry.example.com/fmcd-inference-service
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+resources:
+  limits:
+    nvidia.com/gpu: 1
+    memory: "32Gi"
+    cpu: "8"
+  requests:
+    nvidia.com/gpu: 1
+    memory: "16Gi"
+    cpu: "4"
+
+nodeSelector:
+  nvidia.com/gpu.product: H100
+
+service:
+  port: 8000
+
+# Список моделей сервиса - при масштабировании до 7 моделей просто
+# дописываются новые элементы, шаблон configmap.yaml сам их разложит
+# в configs/models.yaml -> models[].
+models:
+  - name: "cc"
+    artifactsDir: "artifacts/cc"
+    weightsFile: "model.pth"
+    schemaFile: "schema.json"
+    calibratorsFile: "calibrators.json"
+    freqEncodingFile: "freq_encoding.parquet"
+
+inference:
+  device: "cuda"
+  inferBatchSize: 16
+  chunkSize: 100000
+
+task:
+  progressUpdateIntervalSec: 10
+
+# Реальные значения S3 передаются через env (см. templates/deployment.yaml):
+# несекретные - напрямую из values, секретные - из existingSecretName.
+s3:
+  endpointUrl: "https://s3.example.com"
+  bucketIn: "fmcd-bucket-in"
+  bucketOut: "fmcd-bucket-out"
+  region: "us-east-1"
+  useSsl: true
+  verifySsl: true
+  existingSecretName: "fmcd-s3-credentials"

@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-fmcd-inference
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: fmcd-inference
+  template:
+    metadata:
+      labels:
+        app: fmcd-inference
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      containers:
+        - name: fmcd-inference
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /srv/app/configs
+          env:
+            - name: S3_ENDPOINT_URL
+              value: "{{ .Values.s3.endpointUrl }}"
+            - name: S3_BUCKET_IN
+              value: "{{ .Values.s3.bucketIn }}"
+            - name: S3_BUCKET_OUT
+              value: "{{ .Values.s3.bucketOut }}"
+            - name: S3_REGION
+              value: "{{ .Values.s3.region }}"
+            - name: S3_USE_SSL
+              value: "{{ .Values.s3.useSsl }}"
+            - name: S3_VERIFY_SSL
+              value: "{{ .Values.s3.verifySsl }}"
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.existingSecretName }}
+                  key: access-key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.existingSecretName }}
+                  key: secret-key
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-fmcd-inference-config
