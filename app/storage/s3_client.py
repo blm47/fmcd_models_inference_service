@@ -2,8 +2,8 @@
 Обёртка над S3 для потокового чтения/записи PARQUET-ПРЕФИКСОВ (не одиночных
 файлов).
 
-Контракт входа/выхода изменён: s3_input_path и s3_output_path — это
-ПРЕФИКСЫ (папки), под которыми лежит/будет лежать множество parquet-файлов:
+Контракт входа/выхода: s3_input_path и s3_output_path — это ПРЕФИКСЫ
+(папки), под которыми лежит/будет лежать множество parquet-файлов:
   s3://bucket/path/input/
     _SUCCESS
     part-00000-....snappy.parquet
@@ -11,15 +11,21 @@
     ...
 Именно так Spark сохраняет DataFrame через df.write.parquet(prefix).
 
-Для чтения используется pyarrow.dataset — он сам объединяет схему и данные
-всех part-файлов под префиксом в единый источник и умеет отдавать батчи
-фиксированного размера (batch_size), даже если реальные part-файлы Spark
-разного размера и не совпадают по границам с chunk_size.
+ВАЖНО про S3-бэкенд: используется s3fs.S3FileSystem, а НЕ
+pyarrow.fs.S3FileSystem. Причина — у pyarrow.fs.S3FileSystem нет
+официального способа отключить проверку TLS-сертификата (актуально для
+внутренних S3-эндпоинтов с самоподписанным/корпоративным сертификатом,
+см. verify_ssl в S3Config), тогда как s3fs/boto3 поддерживают это
+штатно через client_kwargs={"verify": False}.
 
-Для записи выходной префикс формируется как набор part-файлов
-"part-{idx:05d}.parquet" — по одному файлу на chunk_size строк, плюс
-пустой маркер "_SUCCESS" в конце (по аналогии со Spark), чтобы downstream-
-потребители могли ждать именно этот маркер как признак завершённости записи.
+pyarrow.dataset.dataset(...) умеет принимать fsspec-совместимую
+файловую систему (s3fs реализует fsspec.AbstractFileSystem), поэтому
+весь остальной код (open_dataset/iter_chunks/writer) не меняется.
+
+Правильный путь для прода — не отключать verify_ssl, а подложить
+корпоративный CA-сертификат в образ (update-ca-certificates в
+Dockerfile) и держать verify_ssl=True. verify_ssl=False — временный
+обход для тестового стенда без валидного сертификата.
 """
 
 from dataclasses import dataclass, field
@@ -27,8 +33,8 @@ from dataclasses import dataclass, field
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
-import pyarrow.fs as pafs
 import pyarrow.parquet as pq
+import s3fs
 
 from app.core.config import S3Config
 
@@ -39,27 +45,32 @@ _SUCCESS_MARKER = "_SUCCESS"
 class S3Client:
     settings: S3Config
 
-    def _filesystem(self) -> pafs.S3FileSystem:
-        return pafs.S3FileSystem(
-            endpoint_override=self.settings.endpoint_url,
-            access_key=self.settings.access_key,
-            secret_key=self.settings.secret_key,
-            region=self.settings.region,
-            scheme="https" if self.settings.use_ssl else "http",
-            tls_ca_file_path=None if self.settings.verify_ssl else None,
+    def _filesystem(self) -> s3fs.S3FileSystem:
+        client_kwargs = {}
+        if not self.settings.verify_ssl:
+            client_kwargs["verify"] = False
+
+        return s3fs.S3FileSystem(
+            key=self.settings.access_key,
+            secret=self.settings.secret_key,
+            client_kwargs={
+                "endpoint_url": self.settings.endpoint_url,
+                "region_name": self.settings.region,
+                **client_kwargs,
+            },
+            use_ssl=self.settings.use_ssl,
         )
 
     @staticmethod
     def _strip_bucket_prefix(s3_path: str) -> str:
-        # pyarrow.fs.S3FileSystem ожидает путь без "s3://"
+        # pyarrow.dataset ожидает путь без "s3://" при явно переданной filesystem
         return s3_path.rstrip("/").replace("s3://", "", 1)
 
     def open_dataset(self, s3_prefix: str) -> ds.Dataset:
         """
         Открывает ВСЕ *.parquet файлы под префиксом как единый dataset.
         _SUCCESS и прочие не-parquet файлы pyarrow.dataset игнорирует
-        автоматически (partitioning=None, format="parquet" фильтрует по
-        расширению .parquet).
+        автоматически (format="parquet" фильтрует по расширению .parquet).
         """
         fs = self._filesystem()
         prefix = self._strip_bucket_prefix(s3_prefix)
@@ -99,7 +110,7 @@ class S3Client:
 
 @dataclass
 class ParquetPrefixWriter:
-    fs: pafs.S3FileSystem
+    fs: s3fs.S3FileSystem
     output_prefix: str
     _part_idx: int = field(default=0, init=False)
 
@@ -107,12 +118,12 @@ class ParquetPrefixWriter:
         """Пишет один чанк как отдельный part-файл под output_prefix."""
         table = pa.Table.from_pandas(df_chunk, preserve_index=False)
         part_path = f"{self.output_prefix}/part-{self._part_idx:05d}.parquet"
-        with self.fs.open_output_stream(part_path) as sink:
+        with self.fs.open(part_path, "wb") as sink:
             pq.write_table(table, sink)
         self._part_idx += 1
 
     def close(self) -> None:
         """Кладёт пустой _SUCCESS маркер - признак полностью завершённой записи."""
         success_path = f"{self.output_prefix}/{_SUCCESS_MARKER}"
-        with self.fs.open_output_stream(success_path) as sink:
+        with self.fs.open(success_path, "wb") as sink:
             sink.write(b"")
