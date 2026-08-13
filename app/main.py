@@ -3,7 +3,7 @@
 
 lifespan выполняет всю "тяжёлую" инициализацию один раз при старте пода:
   - загрузка конфига (env + configs/models.yaml)
-  - загрузка всех моделей из списка models[] на GPU + препроцессинг-
+  - загрузка всех моделей из списка models[] на GPU (H100) + препроцессинг-
     артефактов в dict[str, ModelBundle]
   - создание TaskStore/CancellationRegistry/TaskManager/S3Client
 

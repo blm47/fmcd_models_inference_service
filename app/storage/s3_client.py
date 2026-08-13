@@ -1,26 +1,38 @@
 """
-Тонкая обёртка над S3 для потокового чтения/записи parquet чанками.
+Обёртка над S3 для потокового чтения/записи PARQUET-ПРЕФИКСОВ (не одиночных
+файлов).
 
-Дизайн для чанковой обработки 2-3 млн строк:
-  - open_parquet_file: открывает pyarrow.parquet.ParquetFile через S3FileSystem
-    БЕЗ загрузки данных в память — нужно для дешёвой валидации схемы и total_rows.
-  - iter_chunks: генератор, отдающий df_chunk по N строк.
-  - ParquetChunkWriter: инкрементальный писатель, пишет чанки в output по мере
-    готовности, не накапливая весь результат в памяти.
+Контракт входа/выхода изменён: s3_input_path и s3_output_path — это
+ПРЕФИКСЫ (папки), под которыми лежит/будет лежать множество parquet-файлов:
+  s3://bucket/path/input/
+    _SUCCESS
+    part-00000-....snappy.parquet
+    part-00001-....snappy.parquet
+    ...
+Именно так Spark сохраняет DataFrame через df.write.parquet(prefix).
 
-bucket_in/bucket_out из S3Config используются только как дефолтные бакеты для
-валидации/документации; сами пути (s3_input_path/s3_output_path) приходят
-полностью в запросе /infer в виде "s3://bucket/key".
+Для чтения используется pyarrow.dataset — он сам объединяет схему и данные
+всех part-файлов под префиксом в единый источник и умеет отдавать батчи
+фиксированного размера (batch_size), даже если реальные part-файлы Spark
+разного размера и не совпадают по границам с chunk_size.
+
+Для записи выходной префикс формируется как набор part-файлов
+"part-{idx:05d}.parquet" — по одному файлу на chunk_size строк, плюс
+пустой маркер "_SUCCESS" в конце (по аналогии со Spark), чтобы downstream-
+потребители могли ждать именно этот маркер как признак завершённости записи.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 from app.core.config import S3Config
+
+_SUCCESS_MARKER = "_SUCCESS"
 
 
 @dataclass
@@ -34,41 +46,73 @@ class S3Client:
             secret_key=self.settings.secret_key,
             region=self.settings.region,
             scheme="https" if self.settings.use_ssl else "http",
+            tls_ca_file_path=None if self.settings.verify_ssl else None,
         )
 
     @staticmethod
     def _strip_bucket_prefix(s3_path: str) -> str:
         # pyarrow.fs.S3FileSystem ожидает путь без "s3://"
-        return s3_path.replace("s3://", "", 1)
+        return s3_path.rstrip("/").replace("s3://", "", 1)
 
-    def open_parquet_file(self, s3_path: str) -> pq.ParquetFile:
+    def open_dataset(self, s3_prefix: str) -> ds.Dataset:
+        """
+        Открывает ВСЕ *.parquet файлы под префиксом как единый dataset.
+        _SUCCESS и прочие не-parquet файлы pyarrow.dataset игнорирует
+        автоматически (partitioning=None, format="parquet" фильтрует по
+        расширению .parquet).
+        """
         fs = self._filesystem()
-        path = self._strip_bucket_prefix(s3_path)
-        return pq.ParquetFile(fs.open_input_file(path))
+        prefix = self._strip_bucket_prefix(s3_prefix)
+        return ds.dataset(prefix, filesystem=fs, format="parquet")
 
-    def iter_chunks(self, s3_path: str, chunk_size: int):
-        """Генератор df_chunk по chunk_size строк, используя iter_batches pyarrow."""
-        parquet_file = self.open_parquet_file(s3_path)
-        for batch in parquet_file.iter_batches(batch_size=chunk_size):
+    def count_rows(self, s3_prefix: str) -> int:
+        """Дешёвый подсчёт строк по метаданным всех part-файлов, без чтения данных."""
+        dataset = self.open_dataset(s3_prefix)
+        return dataset.count_rows()
+
+    def get_schema_columns(self, s3_prefix: str) -> set[str]:
+        dataset = self.open_dataset(s3_prefix)
+        return set(dataset.schema.names)
+
+    def iter_chunks(self, s3_prefix: str, chunk_size: int):
+        """
+        Генератор df_chunk по chunk_size строк. pyarrow.dataset.to_batches
+        сам "склеивает" record batches из разных part-файлов Spark в батчи
+        нужного размера, поэтому границы chunk_size не привязаны к границам
+        исходных part-файлов.
+        """
+        dataset = self.open_dataset(s3_prefix)
+        for batch in dataset.to_batches(batch_size=chunk_size):
             yield batch.to_pandas()
 
-    def get_writer(self, s3_path: str, schema: pa.Schema) -> "ParquetChunkWriter":
-        fs = self._filesystem()
-        path = self._strip_bucket_prefix(s3_path)
-        sink = fs.open_output_stream(path)
-        writer = pq.ParquetWriter(sink, schema)
-        return ParquetChunkWriter(writer=writer, sink=sink)
+    def get_writer(self, s3_output_prefix: str) -> "ParquetPrefixWriter":
+        """
+        Возвращает писатель, который на каждый write_chunk создаёт новый
+        part-файл под выходным префиксом (по аналогии со Spark part-файлами),
+        а на close() кладёт пустой _SUCCESS маркер.
+        """
+        return ParquetPrefixWriter(
+            fs=self._filesystem(),
+            output_prefix=self._strip_bucket_prefix(s3_output_prefix),
+        )
 
 
 @dataclass
-class ParquetChunkWriter:
-    writer: pq.ParquetWriter
-    sink: object
+class ParquetPrefixWriter:
+    fs: pafs.S3FileSystem
+    output_prefix: str
+    _part_idx: int = field(default=0, init=False)
 
     def write_chunk(self, df_chunk: pd.DataFrame) -> None:
+        """Пишет один чанк как отдельный part-файл под output_prefix."""
         table = pa.Table.from_pandas(df_chunk, preserve_index=False)
-        self.writer.write_table(table)
+        part_path = f"{self.output_prefix}/part-{self._part_idx:05d}.parquet"
+        with self.fs.open_output_stream(part_path) as sink:
+            pq.write_table(table, sink)
+        self._part_idx += 1
 
     def close(self) -> None:
-        self.writer.close()
-        self.sink.close()
+        """Кладёт пустой _SUCCESS маркер - признак полностью завершённой записи."""
+        success_path = f"{self.output_prefix}/{_SUCCESS_MARKER}"
+        with self.fs.open_output_stream(success_path) as sink:
+            sink.write(b"")
