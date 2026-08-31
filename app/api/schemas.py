@@ -28,6 +28,12 @@ class InferRequest(BaseModel):
     )
 
 
+class S3PathNotFoundResponse(BaseModel):
+    error: str = "s3_path_not_found"
+    s3_path: str
+    detail: str
+
+
 class ValidationErrorResponse(BaseModel):
     error: str = "missing_features"
     missing_columns: list[str]

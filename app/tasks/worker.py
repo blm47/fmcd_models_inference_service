@@ -82,6 +82,13 @@ def run_task(
         store.set_status(task_id, TaskStatus.DONE)
         logger.info("Задача %s завершена: processed_rows=%d", task_id, processed_rows)
 
+    except FileNotFoundError as exc:
+        # Входной префикс исчез/стал недоступен уже ПОСЛЕ прохождения
+        # синхронной валидации в /infer (например, TTL-очистка бакета,
+        # гонка с параллельным удалением) - фиксируем как FAILED с понятной
+        # причиной вместо непрозрачного generic-исключения.
+        logger.exception("Задача %s: входной префикс стал недоступен в S3", task_id)
+        store.set_status(task_id, TaskStatus.FAILED, error=f"s3_path_not_found: {exc}")
     except Exception as exc:
         logger.exception("Задача %s упала с ошибкой", task_id)
         store.set_status(task_id, TaskStatus.FAILED, error=str(exc))

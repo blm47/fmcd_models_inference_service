@@ -3,7 +3,8 @@ POST /infer — единственный универсальный эндпои
 
 Синхронная часть (до ответа клиенту):
   1. Найти модель в dict моделей по model_name (404, если нет).
-  2. Провалидировать входной parquet на наличие всех фич модели (422, если не хватает).
+  2. Открыть входной префикс в S3 и провалидировать наличие всех фич модели
+     (404, если сам префикс не существует в S3; 422, если фич не хватает).
   3. Попытаться атомарно занять "слот" активной задачи (409, если уже занято).
 Всё, что после — уходит в BackgroundTasks (сам инференс).
 """
@@ -12,7 +13,13 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
-from app.api.schemas import InferRequest, TaskAcceptedResponse, TaskBusyResponse, ValidationErrorResponse
+from app.api.schemas import (
+    InferRequest,
+    S3PathNotFoundResponse,
+    TaskAcceptedResponse,
+    TaskBusyResponse,
+    ValidationErrorResponse,
+)
 from app.core.config import Settings
 from app.deps import (
     get_cancellation_registry,
@@ -37,7 +44,11 @@ router = APIRouter(tags=["inference"])
 @router.post(
     "/infer",
     response_model=TaskAcceptedResponse,
-    responses={409: {"model": TaskBusyResponse}, 422: {"model": ValidationErrorResponse}},
+    responses={
+        404: {"model": S3PathNotFoundResponse},
+        409: {"model": TaskBusyResponse},
+        422: {"model": ValidationErrorResponse},
+    },
     status_code=202,
 )
 def infer(
@@ -55,7 +66,21 @@ def infer(
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
-    validation = validate_input_parquet(request.s3_input_path, bundle, s3_client)
+    try:
+        validation = validate_input_parquet(request.s3_input_path, bundle, s3_client)
+    except FileNotFoundError as exc:
+        # pyarrow.dataset кидает FileNotFoundError, если под s3_input_path
+        # нет ни одного part-*.parquet файла (опечатка в пути, префикс ещё
+        # не выгружен Spark-джобом, неверный бакет и т.п.).
+        logger.warning("Входной префикс не найден в S3: %s", request.s3_input_path)
+        raise HTTPException(
+            status_code=404,
+            detail=S3PathNotFoundResponse(
+                s3_path=request.s3_input_path,
+                detail=str(exc),
+            ).model_dump(),
+        )
+
     if not validation.is_valid:
         raise HTTPException(
             status_code=422,
