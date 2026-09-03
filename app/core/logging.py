@@ -11,18 +11,22 @@ import sys
 
 
 def setup_logging(level: str = "INFO") -> None:
-    handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | task_id=%(task_id)s | %(message)s",
-        defaults={"task_id": "-"},
-    )
-    handler.setFormatter(formatter)
-    root = logging.getLogger()
-    root.setLevel(level)
-    root.addHandler(handler)
+    from dadm_functions.logger import logger 
+
+    return logger
+    
+#     handler = logging.StreamHandler(sys.stdout)
+#     formatter = logging.Formatter(
+#         fmt="%(asctime)s | %(levelname)s | %(name)s | task_id=%(task_id)s | %(message)s",
+#         defaults={"task_id": "-"},
+#     )
+#     handler.setFormatter(formatter)
+#     root = logging.getLogger()
+#     root.setLevel(level)
+#     root.addHandler(handler)
 
 
-def get_task_logger(logger_name: str, task_id: str) -> logging.LoggerAdapter:
-    """Возвращает logger с уже прибитым task_id в каждой строке."""
-    base = logging.getLogger(logger_name)
-    return logging.LoggerAdapter(base, extra={"task_id": task_id})
+# def get_task_logger(logger_name: str, task_id: str) -> logging.LoggerAdapter:
+#     """Возвращает logger с уже прибитым task_id в каждой строке."""
+#     base = logging.getLogger(logger_name)
+#     return logging.LoggerAdapter(base, extra={"task_id": task_id})

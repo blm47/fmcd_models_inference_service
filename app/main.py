@@ -2,8 +2,8 @@
 Точка входа FastAPI-приложения.
 
 lifespan выполняет всю "тяжёлую" инициализацию один раз при старте пода:
-  - загрузка конфига (env + configs/models.yaml)
-  - загрузка всех моделей из списка models[] на GPU (H100) + препроцессинг-
+  - загрузка конфига (env + config/models.yaml)
+  - загрузка всех моделей из списка models[] на GPU + препроцессинг-
     артефактов в dict[str, ModelBundle]
   - создание TaskStore/CancellationRegistry/TaskManager/S3Client
 
@@ -12,6 +12,7 @@ lifespan выполняет всю "тяжёлую" инициализацию �
 """
 
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 
@@ -28,17 +29,26 @@ from app.tasks.state import TaskStore
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    setup_logging()
-    settings = load_settings()
 
-    models = load_all_models(settings.models, settings.inference)
+    logger = setup_logging()
 
-    app.state.settings = settings
-    app.state.models = models
-    app.state.task_store = TaskStore()
-    app.state.cancellation_registry = CancellationRegistry()
-    app.state.task_manager = TaskManager(app.state.task_store, app.state.cancellation_registry)
-    app.state.s3_client = S3Client(settings.s3)
+    try:
+        settings = load_settings()
+
+        models = load_all_models(settings.models, settings.inference, logger)
+
+        app.state.settings = settings
+        app.state.models = models
+        app.state.task_store = TaskStore()
+        app.state.cancellation_registry = CancellationRegistry()
+        app.state.task_manager = TaskManager(app.state.task_store, app.state.cancellation_registry)
+        app.state.s3_client = S3Client(settings.s3)
+
+    except Exception as exc:
+        import traceback
+        msg = f"lifespan error: {traceback.format_exc()}"
+        print(msg, flush=True)
+        logger.error(msg)
 
     yield
     # На shutdown специально ничего не чистим: если под убивают во время
@@ -49,8 +59,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FMCD Inference Service", lifespan=lifespan)
 app.include_router(infer_router)
 app.include_router(tasks_router)
+# app = FastAPI(title="FMCD Inference Service")
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get('/healthz/readiness')
+async def route_readiness_probe():
+    """ readiness probe """
+    return {'details': 'OK'}
+
+
+@app.get('/healthz/liveness')
+async def route_liveness_probe():
+    """ liveness probe """
+    return {'details': 'OK'}

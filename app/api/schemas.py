@@ -2,13 +2,6 @@
 Pydantic-схемы запросов/ответов. model_name уже заложен в InferRequest
 как задел на масштабирование (сейчас реестр содержит одну модель, но
 контракт API не придётся менять при переходе к 7 моделям).
-
-s3_input_path/s3_output_path - это ПРЕФИКСЫ (папки), а не пути к одиночным
-файлам:
-  - s3_input_path: префикс, под которым Spark сохранил DataFrame
-    (_SUCCESS + множество part-*.parquet).
-  - s3_output_path: префикс, куда сервис запишет part-*.parquet чанками
-    по chunk_size строк + свой _SUCCESS маркер по завершении.
 """
 
 from pydantic import BaseModel, Field
@@ -16,22 +9,16 @@ from pydantic import BaseModel, Field
 from app.tasks.state import TaskStatus
 
 
-class InferRequest(BaseModel):
-    model_name: str = Field(..., description="Имя модели в реестре (на v1 - единственная)")
-    s3_input_path: str = Field(
-        ...,
-        description="Префикс с входными part-*.parquet, напр. s3://bucket/path/input/",
-    )
-    s3_output_path: str = Field(
-        ...,
-        description="Префикс для выходных part-*.parquet, напр. s3://bucket/path/output/",
-    )
-
-
 class S3PathNotFoundResponse(BaseModel):
     error: str = "s3_path_not_found"
     s3_path: str
     detail: str
+
+
+class InferRequest(BaseModel):
+    model_name: str = Field(..., description="Имя модели в реестре")
+    s3_input_path: str = Field(..., description="s3://bucket/path/input/")
+    s3_output_path: str = Field(..., description="s3://bucket/path/output/")
 
 
 class ValidationErrorResponse(BaseModel):

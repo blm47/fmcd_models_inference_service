@@ -3,13 +3,12 @@ Dependency Injection для FastAPI-роутов.
 
 Все "тяжёлые" объекты (dict моделей, TaskStore, TaskManager, S3Client)
 создаются один раз в app.main:lifespan и кладутся в app.state, а роуты
-достают их через Depends(...) - стандартный FastAPI-паттерн, упрощающий
-подмену зависимостей в тестах (override через app.dependency_overrides).
+достают их через Depends(...).
 """
 
 from fastapi import Request
 
-from app.core.config import Settings
+from app.core.config import Settings, load_settings
 from app.models.registry import ModelBundle
 from app.storage.s3_client import S3Client
 from app.tasks.cancellation import CancellationRegistry
@@ -18,7 +17,7 @@ from app.tasks.state import TaskStore
 
 
 def get_settings(request: Request) -> Settings:
-    return request.app.state.settings
+    return getattr(request.app.state, "settings", None) or load_settings()
 
 
 def get_models(request: Request) -> dict[str, ModelBundle]:

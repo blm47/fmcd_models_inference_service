@@ -1,8 +1,6 @@
 """
-Прямой перенос функции pandas_chunk_to_fmcd_batch из вашего ноутбука без изменений
-логики. Вынесена в отдельный модуль, чтобы models/inference.py не разрастался
-и чтобы эту функцию было легко покрыть unit-тестом изолированно (сравнение
-с ожидаемыми shape'ами тензоров на синтетическом df_chunk).
+Прямой перенос функции pandas_chunk_to_fmcd_batch из ноутбука моделистов без изменений
+логики. Вынесена в отдельный модуль, чтобы models/inference.py не разрастался.
 """
 
 import numpy as np
@@ -26,14 +24,9 @@ def pandas_chunk_to_fmcd_batch(
     """
     B = len(df_chunk)
 
-    num_arrays, mask_arrays = [], []
-    for col in num_cols:
-        vals = df_chunk[col].values
-        mask_arrays.append((~pd.isna(df_chunk[col])).astype(np.float32))
-        num_arrays.append(np.nan_to_num(vals, nan=0.0).astype(np.float32))
-
-    num = np.stack(num_arrays, axis=1)
-    mask = np.stack(mask_arrays, axis=1)
+    block = df_chunk[num_cols].to_numpy(dtype=np.float32, copy=True)
+    mask = (~np.isnan(block)).astype(np.float32)
+    num = np.nan_to_num(block, nan=0.0)
 
     cat_arrays = []
     for i, col in enumerate(cat_cols):
@@ -41,6 +34,7 @@ def pandas_chunk_to_fmcd_batch(
         idx = df_chunk[col].fillna(cardinality).astype(np.int64).values
         idx = np.clip(idx, 0, cardinality)
         cat_arrays.append(idx)
+
     cat = np.stack(cat_arrays, axis=1)
 
     return FMCDBatch(

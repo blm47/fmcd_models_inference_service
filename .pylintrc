@@ -1,0 +1,9 @@
+[MASTER]
+ignore=CVS
+persistent=yes
+
+[MESSAGES CONTROL]
+disable=missing-docstring,too-few-public-methods
+
+[FORMAT]
+max-line-length=120

@@ -3,7 +3,7 @@ POST /infer — единственный универсальный эндпои
 
 Синхронная часть (до ответа клиенту):
   1. Найти модель в dict моделей по model_name (404, если нет).
-  2. Открыть входной префикс в S3 и провалидировать наличие всех фич модели
+  2. Провалидировать наличие всех фич модели
      (404, если сам префикс не существует в S3; 422, если фич не хватает).
   3. Попытаться атомарно занять "слот" активной задачи (409, если уже занято).
 Всё, что после — уходит в BackgroundTasks (сам инференс).
@@ -20,6 +20,7 @@ from app.api.schemas import (
     TaskBusyResponse,
     ValidationErrorResponse,
 )
+from app.core.logging import setup_logging
 from app.core.config import Settings
 from app.deps import (
     get_cancellation_registry,
@@ -37,7 +38,7 @@ from app.tasks.manager import TaskAlreadyRunningError, TaskManager
 from app.tasks.state import TaskStore
 from app.tasks.worker import run_task
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 router = APIRouter(tags=["inference"])
 
 
@@ -60,6 +61,7 @@ def infer(
     task_store: TaskStore = Depends(get_task_store),
     cancellation: CancellationRegistry = Depends(get_cancellation_registry),
     s3_client: S3Client = Depends(get_s3_client),
+    logger: logging.Logger = Depends(setup_logging),
 ):
     try:
         bundle = get_model_bundle(models, request.model_name)
@@ -70,21 +72,31 @@ def infer(
         validation = validate_input_parquet(request.s3_input_path, bundle, s3_client)
     except FileNotFoundError as exc:
         # pyarrow.dataset кидает FileNotFoundError, если под s3_input_path
-        # нет ни одного part-*.parquet файла (опечатка в пути, префикс ещё
-        # не выгружен Spark-джобом, неверный бакет и т.п.).
+        # нет ни одного part-*.parquet файла
         logger.warning("Входной префикс не найден в S3: %s", request.s3_input_path)
         raise HTTPException(
             status_code=404,
             detail=S3PathNotFoundResponse(
                 s3_path=request.s3_input_path,
                 detail=str(exc),
-            ).model_dump(),
+            ).dict(),
         )
 
     if not validation.is_valid:
         raise HTTPException(
             status_code=422,
-            detail=ValidationErrorResponse(missing_columns=validation.missing_columns).model_dump(),
+            detail=ValidationErrorResponse(missing_columns=validation.missing_columns).dict(),
+        )
+
+    if s3_client.prefix_has_parquet(request.s3_output_path):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "output_prefix_not_empty",
+                "s3_output_path": request.s3_output_path,
+                "detail": f"Префикс {request.s3_output_path} уже существует в S3. "
+                    f"Сервис не перезаписывает существующие данные.",
+            }
         )
 
     try:
@@ -103,11 +115,11 @@ def infer(
                 status=active.status,
                 progress_pct=active.progress_pct,
                 eta_seconds=active.eta_seconds,
-            ).model_dump(),
+            ).dict(),
         )
 
     background_tasks.add_task(
-        run_task, task, bundle, settings, task_store, cancellation, s3_client
+        run_task, task, bundle, settings, task_store, cancellation, s3_client, logger
     )
 
     return TaskAcceptedResponse(task_id=task.task_id, status=task.status, total_rows=task.total_rows)

@@ -1,11 +1,10 @@
 """
 Модель состояния задачи + потокобезопасное хранилище всех задач за время
-жизни пода (in-memory dict, без TTL — по решению: история не чистится,
-теряется только при рестарте пода).
+жизни пода (in-memory dict).
 
 Дизайн-решение: "текущая активная задача" не отдельная переменная, а
 вычисляется как единственная запись со статусом RUNNING в TaskStore
-(в системе может быть только 0 или 1 активная задача одновременно —
+(в системе может быть только 1 активная задача одновременно -
 это гарантируется в TaskManager.try_start_task через lock).
 """
 
@@ -36,9 +35,6 @@ class TaskState:
     updated_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     error: str | None = None
-
-    # Накопленное время именно GPU-инференса (без учёта S3 I/O), нужно для ETA
-    # по требованию "ETA считается только по фазе инференса".
     inference_elapsed_sec: float = 0.0
 
     @property
@@ -55,6 +51,7 @@ class TaskState:
         """
         if self.processed_rows == 0 or self.status != TaskStatus.RUNNING:
             return None
+
         remaining_rows = max(self.total_rows - self.processed_rows, 0)
         avg_sec_per_row = self.inference_elapsed_sec / self.processed_rows
         return round(avg_sec_per_row * remaining_rows, 1)
