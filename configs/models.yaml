@@ -11,8 +11,8 @@ models:
 
 inference:
   device: "cuda"
-  infer_batch_size: 16
-  chunk_size: 100000
+  infer_batch_size: 1000
+  chunk_size: 10_00
 
 # Значения S3 берутся из глобальных переменных окружения (пробрасываются
 # Helm-ом в Deployment env). Здесь указываем не сами значения, а ИМЕНА
@@ -29,3 +29,18 @@ s3:
 
 task:
   progress_update_interval_sec: 10
+
+# Task tracker: где физически хранится состояние задач между подами.
+# backend: "s3" (сейчас) | "redis"/"postgres" (заложено на будущее,
+# смена значения не требует изменений в коде TaskManager/TaskStore).
+# state_key/lock_key - относительно bucket_out (см. s3.bucket_out_env).
+# Правило активности задачи - "1 активная задача на 1 под" (не на весь
+# сервис) - позволяет сервису на N подах вести до N параллельных задач.
+task_store:
+  backend: "s3"
+  state_key: "_system/fmcd_models/task_state.json"
+  lock_key: "_system/fmcd_models/task_state.lock"
+  lease_seconds: 60
+  wait_timeout_sec: 300
+  poll_interval_sec: 1.0
+  retention_months: 6

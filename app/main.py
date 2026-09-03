@@ -13,6 +13,8 @@ lifespan выполняет всю "тяжёлую" инициализацию �
 
 from contextlib import asynccontextmanager
 import logging
+import os
+import socket
 
 from fastapi import FastAPI
 
@@ -20,6 +22,7 @@ from app.api.routes_infer import router as infer_router
 from app.api.routes_tasks import router as tasks_router
 from app.core.config import load_settings
 from app.core.logging import setup_logging
+from app.tasks.backends.factory import create_task_storage_backend
 from app.models.loader import load_all_models
 from app.storage.s3_client import S3Client
 from app.tasks.cancellation import CancellationRegistry
@@ -37,12 +40,18 @@ async def lifespan(app: FastAPI):
 
         models = load_all_models(settings.models, settings.inference, logger)
 
+        task_storage_backend = create_task_storage_backend(settings.task_store, settings.s3)
+
         app.state.settings = settings
         app.state.models = models
-        app.state.task_store = TaskStore()
+        app.state.task_store = TaskStore(task_storage_backend)
         app.state.cancellation_registry = CancellationRegistry()
-        app.state.task_manager = TaskManager(app.state.task_store, app.state.cancellation_registry)
+        app.state.task_manager = TaskManager(
+            app.state.task_store, app.state.cancellation_registry, pod_id=pod_id
+        )
         app.state.s3_client = S3Client(settings.s3)
+        app.state.pod_id = os.environ.get("HOSTNAME", socket.gethostname())
+        logger.info(f"Сервис запущен на поде pod_id={pod_id}")
 
     except Exception as exc:
         import traceback

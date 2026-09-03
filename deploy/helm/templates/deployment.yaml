@@ -26,6 +26,10 @@ spec:
             - name: config
               mountPath: /srv/app/configs
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: S3_ENDPOINT_URL
               value: "{{ .Values.s3.endpointUrl }}"
             - name: S3_BUCKET_IN

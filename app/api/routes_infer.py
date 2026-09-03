@@ -108,10 +108,14 @@ def infer(
         )
     except TaskAlreadyRunningError as exc:
         active = exc.active_task
+        # На ЭТОМ поде (task_manager.pod_id) уже есть активная задача -
+        # отбой 409. Задача на ДРУГОМ поде до сюда не долетает: try_start_task
+        # проверяет активность строго в разрезе pod_id (см. TaskManager/TaskStore).
         raise HTTPException(
             status_code=409,
             detail=TaskBusyResponse(
                 task_id=active.task_id,
+                pod_id=active.pod_id,
                 status=active.status,
                 progress_pct=active.progress_pct,
                 eta_seconds=active.eta_seconds,
@@ -122,4 +126,6 @@ def infer(
         run_task, task, bundle, settings, task_store, cancellation, s3_client, logger
     )
 
-    return TaskAcceptedResponse(task_id=task.task_id, status=task.status, total_rows=task.total_rows)
+    return TaskAcceptedResponse(
+        task_id=task.task_id, pod_id=task.pod_id, status=task.status, total_rows=task.total_rows
+    )

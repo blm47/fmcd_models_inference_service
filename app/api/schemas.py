@@ -28,6 +28,7 @@ class ValidationErrorResponse(BaseModel):
 
 class TaskAcceptedResponse(BaseModel):
     task_id: str
+    pod_id: str = Field(..., description="Под, который взял задачу в работу")
     status: TaskStatus
     total_rows: int
 
@@ -35,6 +36,7 @@ class TaskAcceptedResponse(BaseModel):
 class TaskBusyResponse(BaseModel):
     error: str = "task_already_running"
     task_id: str
+    pod_id: str = Field(..., description="Под, на котором уже выполняется активная задача")
     status: TaskStatus
     progress_pct: float
     eta_seconds: float | None
@@ -43,6 +45,7 @@ class TaskBusyResponse(BaseModel):
 class TaskStatusResponse(BaseModel):
     task_id: str
     model_name: str
+    pod_id: str
     status: TaskStatus
     processed_rows: int
     total_rows: int
@@ -54,3 +57,22 @@ class TaskStatusResponse(BaseModel):
 class TaskAbortResponse(BaseModel):
     task_id: str
     status: TaskStatus
+
+
+class ActiveTaskSummary(BaseModel):
+    task_id: str
+    pod_id: str
+    model_name: str
+    status: TaskStatus
+    progress_pct: float
+    eta_seconds: float | None
+
+
+class ActiveTasksResponse(BaseModel):
+    """
+    Диагностический эндпоинт: все активные задачи по всем подам сервиса
+    (правило "1 активная задача на 1 под" - при N=3 подах здесь может
+    быть до 3 записей одновременно).
+    """
+
+    active_tasks: list[ActiveTaskSummary]

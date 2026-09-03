@@ -38,6 +38,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() in ("1", "true", "yes", "y", "on")
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return int(value)
+
+
 @dataclass
 class ModelConfig:
     """Описание одной модели из списка models.yaml -> models[]."""
@@ -76,11 +83,34 @@ class TaskConfig:
 
 
 @dataclass
+class TaskStoreConfig:
+    """
+    Конфигурация физического хранения состояния задач (task tracker).
+
+    backend: "s3" (сейчас) | "redis" | "postgres" (заложено на будущее -
+    смена значения не требует изменений в TaskManager/TaskStore, только
+    в фабрике create_task_storage_backend()).
+
+    retention_months читается из переменной окружения
+    TASK_STORE_RETENTION_MONTHS, по умолчанию 6.
+    """
+
+    backend: str = "s3"
+    state_key: str
+    lock_key: str
+    lease_seconds: int
+    wait_timeout_sec: int
+    poll_interval_sec: float
+    retention_months: int
+
+
+@dataclass
 class Settings:
     models: list[ModelConfig]
     inference: InferenceConfig
     s3: S3Config
     task: TaskConfig
+    task_store: TaskStoreConfig
 
     def get_model_config(self, name: str) -> ModelConfig:
         for m in self.models:
@@ -133,11 +163,27 @@ def load_settings(config_path: str = "configs/models.yaml") -> Settings:
         verify_ssl=_env_bool(s3_raw["verify_ssl_env"], True),
     )
 
+    task_store_raw = raw.get("task_store", {})
+    task_store = TaskStoreConfig(
+        backend=os.environ.get("TASK_STORE_BACKEND", task_store_raw.get("backend", "s3")),
+        state_key=task_store_raw.get("state_key"),
+        lock_key=task_store_raw.get("lock_key"),
+        lease_seconds=_env_int("TASK_STORE_LEASE_SECONDS", task_store_raw.get("lease_seconds")),
+        wait_timeout_sec=_env_int("TASK_STORE_WAIT_TIMEOUT_SEC", task_store_raw.get("wait_timeout_sec")),
+        poll_interval_sec=float(
+            os.environ.get("TASK_STORE_POLL_INTERVAL_SEC", task_store_raw.get("poll_interval_sec"))
+        ),
+        retention_months=_env_int(
+            "TASK_STORE_RETENTION_MONTHS", task_store_raw.get("retention_months", 6)
+        ),
+    )
+
     _settings_cache = Settings(
         models=models,
         inference=InferenceConfig(**raw.get("inference", {})),
         s3=s3,
         task=TaskConfig(**raw.get("task", {})),
+        task_store=task_store,
     )
     return _settings_cache
 

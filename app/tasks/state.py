@@ -1,17 +1,15 @@
 """
-Модель состояния задачи + потокобезопасное хранилище всех задач за время
-жизни пода (in-memory dict).
-
-Дизайн-решение: "текущая активная задача" не отдельная переменная, а
-вычисляется как единственная запись со статусом RUNNING в TaskStore
-(в системе может быть только 1 активная задача одновременно -
-это гарантируется в TaskManager.try_start_task через lock).
+Модель состояния задачи + TaskStore - фасад над выбранным
+TaskStorageBackend (см. app/tasks/backends/).
 """
 
-import threading
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+
+from app.tasks.backends.base import TaskStorageBackend
 
 
 class TaskStatus(str, Enum):
@@ -30,6 +28,7 @@ class TaskState:
     s3_output_path: str
     status: TaskStatus
     total_rows: int
+    pod_id: str = "unknown"
     processed_rows: int = 0
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -58,41 +57,104 @@ class TaskState:
 
 
 class TaskStore:
-    """Потокобезопасное хранилище всех TaskState за время жизни пода."""
+    """
+    Фасад над TaskStorageBackend. Публичный API идентичен старой
+    in-memory реализации (v1), кроме get_active(pod_id) и
+    try_add_if_no_active(task), которые теперь работают в разрезе
+    конкретного pod_id (см. докстринг модуля, раздел v3).
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._tasks: dict[str, TaskState] = {}
+    Разделение read/write по договорённости с бизнес-требованиями:
+      - get()/get_active() -> backend.read_state() - без захвата lock,
+        т.к. это read-only операции (в первую очередь GET /status).
+      - add()/update_progress()/set_status() -> backend.mutate() -
+        критическая секция read-modify-write, обязательно под lock'ом
+        backend'а (при S3-backend'е - lease-lock).
+    """
+
+    def __init__(self, backend: TaskStorageBackend) -> None:
+        self._backend = backend
 
     def add(self, task: TaskState) -> None:
-        with self._lock:
-            self._tasks[task.task_id] = task
+        def _add(state: dict[str, TaskState]) -> dict[str, TaskState]:
+            state[task.task_id] = task
+            return state
+
+        self._backend.mutate(_add)
 
     def get(self, task_id: str) -> TaskState | None:
-        with self._lock:
-            return self._tasks.get(task_id)
+        return self._backend.read_state().get(task_id)
 
-    def get_active(self) -> TaskState | None:
-        """Возвращает единственную задачу в статусе RUNNING/ABORTING, если есть."""
-        with self._lock:
-            for task in self._tasks.values():
-                if task.status in (TaskStatus.RUNNING, TaskStatus.ABORTING):
-                    return task
+    def get_active(self, pod_id: str | None = None) -> TaskState | None:
+        """
+        Возвращает активную (RUNNING/ABORTING) задачу.
+
+        pod_id=None  - возвращает ЛЮБУЮ активную задачу в системе
+                        (по любому поду) - полезно для общей диагностики.
+        pod_id=<str> - возвращает активную задачу ТОЛЬКО на этом поде,
+                        если она есть (используется в основном сценарии
+                        "не более одной активной задачи на под").
+        """
+        for task in self._backend.read_state().values():
+            if task.status not in (TaskStatus.RUNNING, TaskStatus.ABORTING):
+                continue
+            if pod_id is None or task.pod_id == pod_id:
+                return task
         return None
 
+    def get_all_active(self) -> list[TaskState]:
+        """Все активные задачи по всем подам (для наблюдаемости/диагностики)."""
+        return [
+            task
+            for task in self._backend.read_state().values()
+            if task.status in (TaskStatus.RUNNING, TaskStatus.ABORTING)
+        ]
+
     def update_progress(self, task_id: str, processed_rows: int, inference_elapsed_sec: float) -> None:
-        with self._lock:
-            task = self._tasks[task_id]
+        def _update(state: dict[str, TaskState]) -> dict[str, TaskState]:
+            task = state[task_id]
             task.processed_rows = processed_rows
             task.inference_elapsed_sec = inference_elapsed_sec
             task.updated_at = time.time()
+            return state
+
+        self._backend.mutate(_update)
 
     def set_status(self, task_id: str, status: TaskStatus, error: str | None = None) -> None:
-        with self._lock:
-            task = self._tasks[task_id]
+        def _update(state: dict[str, TaskState]) -> dict[str, TaskState]:
+            task = state[task_id]
             task.status = status
             task.updated_at = time.time()
             if status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED):
                 task.finished_at = time.time()
             if error is not None:
                 task.error = error
+            return state
+
+        self._backend.mutate(_update)
+
+    def try_add_if_no_active(self, task: TaskState) -> TaskState | None:
+        """
+        Атомарно (в рамках ОДНОГО backend.mutate()-вызова, т.е. под общим
+        межподовым lock'ом): если на поде task.pod_id уже есть активная
+        задача - возвращает её без изменений; иначе добавляет task и
+        возвращает None.
+
+        Проверка активности выполняется СТРОГО в разрезе pod_id: задача
+        на другом поде не мешает взять новую задачу на текущем - правило
+        "1 активная задача на 1 под", а не "1 активная задача на весь
+        сервис".
+        """
+        result: dict[str, TaskState | None] = {"active": None}
+
+        def _try_add(state: dict[str, TaskState]) -> dict[str, TaskState]:
+            for existing in state.values():
+                if existing.pod_id != task.pod_id:
+                    continue
+                if existing.status in (TaskStatus.RUNNING, TaskStatus.ABORTING):
+                    result["active"] = existing
+                    return state
+            state[task.task_id] = task
+            return state
+
+        self._backend.mutate(_try_add)
+        return result["active"]
