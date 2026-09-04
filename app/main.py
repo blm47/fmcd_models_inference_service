@@ -42,6 +42,8 @@ async def lifespan(app: FastAPI):
 
         task_storage_backend = create_task_storage_backend(settings.task_store, settings.s3)
 
+        pod_id = os.environ.get("HOSTNAME", socket.gethostname())
+
         app.state.settings = settings
         app.state.models = models
         app.state.task_store = TaskStore(task_storage_backend)
@@ -50,7 +52,15 @@ async def lifespan(app: FastAPI):
             app.state.task_store, app.state.cancellation_registry, pod_id=pod_id
         )
         app.state.s3_client = S3Client(settings.s3)
-        app.state.pod_id = os.environ.get("HOSTNAME", socket.gethostname())
+        app.state.pod_id = pod_id
+
+        # Убиваем повисшие таски в случае рестарта ПОДа
+        active_tasks = app.state.task_store.get_all_active()
+        local_active_task = [task.task_id for task in active_tasks if task.pod_id == pod_id]
+        for bad_task_id in local_active_task:
+            logger.warn(f"Found active task {bad_task_id} on pod {pod_id}, aborting it")
+            app.state.task_store.set_status(bad_task_id, TaskStatus.FAILED)
+            
         logger.info(f"Сервис запущен на поде pod_id={pod_id}")
 
     except Exception as exc:

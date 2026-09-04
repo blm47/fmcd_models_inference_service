@@ -11,8 +11,8 @@ models:
 
 inference:
   device: "cuda"
-  infer_batch_size: 1000
-  chunk_size: 10_00
+  infer_batch_size: 500
+  chunk_size: 5_000
 
 # Значения S3 берутся из глобальных переменных окружения (пробрасываются
 # Helm-ом в Deployment env). Здесь указываем не сами значения, а ИМЕНА
