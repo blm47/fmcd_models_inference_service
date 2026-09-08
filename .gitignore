@@ -1,0 +1,83 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+.ipynb_checkpoints/
+.benchmarks/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage.json
+
+# General, package manager and GPU compilation caches
+.cache/
+cache/
+.pip-cache/
+.uv-cache/
+.torch/
+.triton/
+.nv/
+torch_extensions/
+torchinductor_*/
+
+# Temporary files and directories
+tmp/
+temp/
+.tmp/
+.temp/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+
+# Runtime logs and process files
+logs/
+*.log
+*.log.*
+*.pid
+*.pid.lock
+
+# Local environment configuration (keep example files)
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Editor settings and OS metadata
+.vscode/
+.idea/
+.vs/
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
