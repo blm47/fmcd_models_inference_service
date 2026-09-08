@@ -27,7 +27,7 @@ from app.models.loader import load_all_models
 from app.storage.s3_client import S3Client
 from app.tasks.cancellation import CancellationRegistry
 from app.tasks.manager import TaskManager
-from app.tasks.state import TaskStore
+from app.tasks.state import TaskStore, TaskStatus
 
 
 @asynccontextmanager
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
         for bad_task_id in local_active_task:
             logger.warn(f"Found active task {bad_task_id} on pod {pod_id}, aborting it")
             app.state.task_store.set_status(bad_task_id, TaskStatus.FAILED)
-            
+
         logger.info(f"Сервис запущен на поде pod_id={pod_id}")
 
     except Exception as exc:
