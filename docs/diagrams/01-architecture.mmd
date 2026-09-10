@@ -1,59 +1,9 @@
 flowchart TB
-    H[("Hadoop / HDFS")]
-
-    subgraph AF["Airflow — целевой процесс"]
-        direction TB
-        subgraph D1["DAG модели credit_cards"]
-            A1["Hadoop → S3"] --> B1["Кастомный оператор<br/>POST /infer → ожидание статуса"] --> C1["S3 → Hadoop"]
-        end
-        subgraph D2["DAG модели B"]
-            A2["Hadoop → S3"] --> B2["Кастомный оператор<br/>POST /infer → ожидание статуса"] --> C2["S3 → Hadoop"]
-        end
-        subgraph DN["DAG модели N"]
-            AN["Hadoop → S3"] --> BN["Кастомный оператор<br/>POST /infer → ожидание статуса"] --> CN["S3 → Hadoop"]
-        end
-    end
-
-    subgraph S3["S3 — общие данные и состояние"]
-        IN[("Входные префиксы моделей<br/>part-*.parquet + _SUCCESS")]
-        Q[("Один системный JSON<br/>revision + tasks<br/>QUEUED / RUNNING / итог")]
-        OUT[("Выходные префиксы моделей<br/>part-*.parquet + _SUCCESS")]
-    end
-
-    subgraph K8S["Kubernetes — Deployment"]
-        LB["Балансировщик / Service"]
-        subgraph P1["ПОД 1 — один процесс Uvicorn"]
-            API["FastAPI<br/>приём, статус, отмена"]
-            STORE["TaskStore<br/>GET + PUT If-Match"]
-            LOOP["Consumer<br/>одна задача одновременно"]
-            GPU["GPU worker<br/>чанки → батчи → результат"]
-            HB["Heartbeat-поток<br/>только во время выполнения"]
-            MON["Монитор<br/>таймауты + retention"]
-            LOG["Общий dadm logger<br/>info / warn / error"]
-            API --> STORE
-            LOOP --> STORE
-            LOOP --> GPU
-            GPU --> STORE
-            HB --> STORE
-            MON --> STORE
-            GPU -.-> LOG
-            API -.-> LOG
-        end
-        P2["ПОД 2<br/>такие же API, consumer,<br/>GPU, heartbeat и монитор"]
-        PN["ПОД N<br/>такие же компоненты"]
-        LB --> API
-        LB --> P2
-        LB --> PN
-    end
-
-    H --> A1 & A2 & AN
-    A1 & A2 & AN --> IN
-    B1 & B2 & BN -->|"HTTP: запуск и polling"| LB
-    STORE <-->|"CAS: без lock-файла и DELETE"| Q
-    P2 & PN <-->|"Общая очередь через CAS"| Q
-    IN -->|"Чтение чанками"| GPU
-    GPU -->|"Запись результатов"| OUT
-    P2 & PN <-->|"Чтение входа"| IN
-    P2 & PN -->|"Запись результата"| OUT
-    OUT --> C1 & C2 & CN
-    C1 & C2 & CN --> H
+    H1[("Исходные данные в Hadoop")]
+    E["Airflow переносит данные в S3"]
+    I[("Входные данные в S3")]
+    A["Оператор Airflow отправляет заявку<br/>и ждёт завершения расчёта"]
+    S["Сервис рассчитывает модель"]
+    O[("Результаты в S3")]
+    R["После успеха Airflow переносит<br/>результаты обратно в Hadoop"]
+    H1 --> E --> I --> A --> S --> O --> R
