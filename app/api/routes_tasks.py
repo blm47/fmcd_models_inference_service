@@ -1,10 +1,8 @@
 """
 GET /tasks/{task_id}/status и POST /tasks/{task_id}/abort.
 
-Читают/мутируют состояние из in-memory TaskStore/CancellationRegistry —
-по решению архитектуры история задач хранится "в рамках жизни пода" без
-внешнего стораджа, поэтому 404 отдаётся только если task_id вообще не
-встречался за время жизни текущего пода.
+Статусы и запросы отмены разделяются между подами через S3. История
+хранится до retention_months; потерявшие heartbeat задачи не активны.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,7 +21,11 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
 @router.get("/{task_id}/status", response_model=TaskStatusResponse)
-def get_task_status(task_id: str, task_manager: TaskManager = Depends(get_task_manager)):
+def get_task_status(
+    task_id: str,
+    task_manager: TaskManager = Depends(get_task_manager),
+    task_store: TaskStore = Depends(get_task_store),
+):
     task = task_manager.get_status(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Задача {task_id} не найдена")
@@ -38,6 +40,8 @@ def get_task_status(task_id: str, task_manager: TaskManager = Depends(get_task_m
         progress_pct=task.progress_pct,
         eta_seconds=task.eta_seconds,
         error=task.error,
+        heartbeat_at=task.heartbeat_at,
+        executor_alive=task_store.executor_alive(task),
     )
 
 

@@ -52,12 +52,18 @@ class TaskStorageBackend(abc.ABC):
     @abc.abstractmethod
     def mutate(self, fn: MutateFn) -> dict[str, "TaskState"]:
         """
-        Атомарно (относительно других mutate() вызовов, в т.ч. из других
-        подов) выполняет: read -> fn(state) -> write. Возвращает итоговое
-        записанное состояние.
+        Выполняет read -> fn(state) -> write с гарантиями конкретного
+        backend. S3 без условных записей обеспечивает только best-effort
+        исключение между подами. fn не должен иметь внешних побочных эффектов.
 
         Реализация backend'а сама решает, как обеспечить взаимное
         исключение (lease-lock файл в S3, Redis-лок, Postgres FOR UPDATE),
         но снаружи это выглядит как одна атомарная операция.
         """
         raise NotImplementedError
+
+    def cleanup(self) -> None:
+        """Периодическая очистка истории; реализации без retention могут пропустить."""
+
+    def initialize(self) -> None:
+        """Создать фиксированные объекты хранилища, если они ещё отсутствуют."""

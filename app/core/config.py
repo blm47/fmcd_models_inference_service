@@ -17,6 +17,7 @@
     инференса на 2-3 млн строк.
 """
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,10 @@ def _env_int(name: str, default: int) -> int:
     if value is None:
         return default
     return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, default))
 
 
 @dataclass
@@ -96,12 +101,38 @@ class TaskStoreConfig:
     """
 
     backend: str = "s3"
-    state_key: str
-    lock_key: str
-    lease_seconds: int
-    wait_timeout_sec: int
-    poll_interval_sec: float
-    retention_months: int
+    state_key: str = "_system/fmcd_models/task_state.json"
+    lock_key: str = "_system/fmcd_models/task_state.lock"
+    lease_seconds: float = 60
+    wait_timeout_sec: float = 300
+    poll_interval_sec: float = 1.0
+    retention_months: int = 6
+    heartbeat_interval_sec: float = 30
+    heartbeat_timeout_sec: float = 180
+    cleanup_interval_sec: float = 3600
+
+    def __post_init__(self) -> None:
+        for name in (
+            "lease_seconds", "wait_timeout_sec", "poll_interval_sec",
+            "heartbeat_interval_sec", "heartbeat_timeout_sec", "cleanup_interval_sec",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"task_store.{name} must be finite and positive")
+        if self.heartbeat_timeout_sec <= self.heartbeat_interval_sec:
+            raise ValueError("task_store.heartbeat_timeout_sec must exceed heartbeat_interval_sec")
+        if (
+            isinstance(self.retention_months, bool)
+            or not isinstance(self.retention_months, int)
+            or self.retention_months <= 0
+        ):
+            raise ValueError("task_store.retention_months must be a positive integer")
+        for name in ("state_key", "lock_key"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip("/"):
+                raise ValueError(f"task_store.{name} must be a non-empty object key")
+        if self.state_key.lstrip("/") == self.lock_key.lstrip("/"):
+            raise ValueError("task_store.state_key and lock_key must be different")
 
 
 @dataclass
@@ -164,17 +195,34 @@ def load_settings(config_path: str = "configs/models.yaml") -> Settings:
     )
 
     task_store_raw = raw.get("task_store", {})
+    defaults = TaskStoreConfig()
     task_store = TaskStoreConfig(
         backend=os.environ.get("TASK_STORE_BACKEND", task_store_raw.get("backend", "s3")),
-        state_key=task_store_raw.get("state_key"),
-        lock_key=task_store_raw.get("lock_key"),
-        lease_seconds=_env_int("TASK_STORE_LEASE_SECONDS", task_store_raw.get("lease_seconds")),
-        wait_timeout_sec=_env_int("TASK_STORE_WAIT_TIMEOUT_SEC", task_store_raw.get("wait_timeout_sec")),
-        poll_interval_sec=float(
-            os.environ.get("TASK_STORE_POLL_INTERVAL_SEC", task_store_raw.get("poll_interval_sec"))
+        state_key=_env("TASK_STORE_STATE_KEY", task_store_raw.get("state_key", defaults.state_key)),
+        lock_key=_env("TASK_STORE_LOCK_KEY", task_store_raw.get("lock_key", defaults.lock_key)),
+        lease_seconds=_env_float(
+            "TASK_STORE_LEASE_SECONDS", task_store_raw.get("lease_seconds", defaults.lease_seconds)
+        ),
+        wait_timeout_sec=_env_float(
+            "TASK_STORE_WAIT_TIMEOUT_SEC", task_store_raw.get("wait_timeout_sec", defaults.wait_timeout_sec)
+        ),
+        poll_interval_sec=_env_float(
+            "TASK_STORE_POLL_INTERVAL_SEC", task_store_raw.get("poll_interval_sec", defaults.poll_interval_sec)
         ),
         retention_months=_env_int(
-            "TASK_STORE_RETENTION_MONTHS", task_store_raw.get("retention_months", 6)
+            "TASK_STORE_RETENTION_MONTHS", task_store_raw.get("retention_months", defaults.retention_months)
+        ),
+        heartbeat_interval_sec=_env_float(
+            "TASK_STORE_HEARTBEAT_INTERVAL_SEC",
+            task_store_raw.get("heartbeat_interval_sec", defaults.heartbeat_interval_sec),
+        ),
+        heartbeat_timeout_sec=_env_float(
+            "TASK_STORE_HEARTBEAT_TIMEOUT_SEC",
+            task_store_raw.get("heartbeat_timeout_sec", defaults.heartbeat_timeout_sec),
+        ),
+        cleanup_interval_sec=_env_float(
+            "TASK_STORE_CLEANUP_INTERVAL_SEC",
+            task_store_raw.get("cleanup_interval_sec", defaults.cleanup_interval_sec),
         ),
     )
 

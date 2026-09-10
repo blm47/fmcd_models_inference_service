@@ -40,6 +40,19 @@ inference:
 task:
   progressUpdateIntervalSec: 10
 
+# Два постоянных S3-объекта для всех подов, без DELETE.
+taskStore:
+  backend: "s3"
+  stateKey: "_system/fmcd_models/task_state.json"
+  lockKey: "_system/fmcd_models/task_state.lock"
+  leaseSeconds: 60
+  waitTimeoutSec: 300
+  pollIntervalSec: 1.0
+  retentionMonths: 6
+  heartbeatIntervalSec: 30
+  heartbeatTimeoutSec: 180
+  cleanupIntervalSec: 3600
+
 # Реальные значения S3 передаются через env (см. templates/deployment.yaml):
 # несекретные - напрямую из values, секретные - из existingSecretName.
 s3:

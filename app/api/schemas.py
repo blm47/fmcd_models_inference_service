@@ -52,6 +52,8 @@ class TaskStatusResponse(BaseModel):
     progress_pct: float
     eta_seconds: float | None
     error: str | None
+    heartbeat_at: float | None = None
+    executor_alive: bool = False
 
 
 class TaskAbortResponse(BaseModel):

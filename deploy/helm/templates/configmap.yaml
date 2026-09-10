@@ -28,3 +28,14 @@ data:
       verify_ssl_env: "S3_VERIFY_SSL"
     task:
       progress_update_interval_sec: {{ .Values.task.progressUpdateIntervalSec }}
+    task_store:
+      backend: {{ .Values.taskStore.backend | quote }}
+      state_key: {{ .Values.taskStore.stateKey | quote }}
+      lock_key: {{ .Values.taskStore.lockKey | quote }}
+      lease_seconds: {{ .Values.taskStore.leaseSeconds }}
+      wait_timeout_sec: {{ .Values.taskStore.waitTimeoutSec }}
+      poll_interval_sec: {{ .Values.taskStore.pollIntervalSec }}
+      retention_months: {{ .Values.taskStore.retentionMonths }}
+      heartbeat_interval_sec: {{ .Values.taskStore.heartbeatIntervalSec }}
+      heartbeat_timeout_sec: {{ .Values.taskStore.heartbeatTimeoutSec }}
+      cleanup_interval_sec: {{ .Values.taskStore.cleanupIntervalSec }}

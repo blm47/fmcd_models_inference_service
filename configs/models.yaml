@@ -44,3 +44,6 @@ task_store:
   wait_timeout_sec: 300
   poll_interval_sec: 1.0
   retention_months: 6
+  heartbeat_interval_sec: 30
+  heartbeat_timeout_sec: 180
+  cleanup_interval_sec: 3600
