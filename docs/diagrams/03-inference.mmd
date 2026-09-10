@@ -1,0 +1,93 @@
+sequenceDiagram
+    autonumber
+    participant H as Hadoop / HDFS
+    participant A as Airflow — DAG модели
+    participant S as S3 — parquet
+    participant L as Балансировщик
+    participant API as API любого пода
+    participant Q as S3 — общий JSON очереди
+    participant P1 as Consumer ПОД1
+    participant P2 as Consumer ПОД2
+    participant W as GPU worker победившего пода
+    participant M as Heartbeat и монитор
+
+    Note over H,M: Разные DAG выполняют этот сценарий независимо, с разными model_name и префиксами.
+    A->>H: Прочитать исходные данные
+    H-->>A: Данные модели
+    A->>S: Сохранить входные parquet и _SUCCESS
+    A->>L: POST /infer: model_name, пути, idempotency_key
+    L->>API: Передать запрос любому поду, включая занятый
+    API->>Q: Найти прежнюю задачу по ключу
+    alt Такой запрос уже принят
+        Q-->>API: Существующий task_id и текущий статус
+        API-->>A: 202: прежняя задача, без повторного инференса
+    else Новый запрос
+        API->>API: Проверить пути и наличие модели
+        API->>S: Проверить колонки, число строк и пустой выход
+        API->>Q: GET JSON + ETag
+        API->>API: Проверить ключ, резервирование выхода и лимит очереди
+        API->>Q: PUT If-Match: новая задача QUEUED, revision + 1
+        Note over API,Q: При CAS-конфликте — перечитать JSON и заново применить изменение.<br/>После потери ответа PUT — проверить, не сохранён ли уже запрос.
+        Q-->>API: Запись подтверждена
+        API-->>A: 202: task_id, QUEUED, pod_id = null
+    end
+
+    par Свободный ПОД1 опрашивает очередь
+        P1->>Q: GET: выбрать старейшую доступную QUEUED
+        Q-->>P1: Задача T и ETag X
+    and Свободный ПОД2 опрашивает очередь
+        P2->>Q: GET: выбрать старейшую доступную QUEUED
+        Q-->>P2: Та же задача T и ETag X
+    end
+    P1->>Q: PUT If-Match X: T → RUNNING, pod_id, owner_id
+    Q-->>P1: 200 — захват подтверждён
+    P2->>Q: PUT If-Match X: попытка забрать T
+    Q-->>P2: 412 — версия уже изменилась
+    P2->>Q: Перечитать очередь и выбрать другую задачу
+    Note over P1,P2: ПОД1 — победитель только в этом примере.<br/>Занятый consumer не забирает следующую задачу.
+    P1->>W: Запустить задачу T
+    W->>S: Повторно проверить пустой выходной префикс
+
+    par Выполнение инференса
+        loop Для каждого входного чанка
+            W->>S: Прочитать чанк parquet
+            W->>Q: Проверить статус, владельца, таймаут и отмену
+            loop Для каждого GPU-батча внутри чанка
+                W->>W: Проверить shutdown / сигнал потери задачи
+                W->>W: Препроцессинг → GPU forward → калибрация
+                W->>W: Проверить shutdown после батча
+            end
+            W->>Q: Проверить задачу перед записью
+            W->>S: Записать part-N.parquet
+            opt Настало время обновления прогресса
+                W->>Q: CAS: processed_rows, время инференса, updated_at
+            end
+        end
+    and Обслуживание очереди
+        loop Heartbeat каждые 30 секунд, пока worker работает
+            M->>Q: CAS: обновить heartbeat активной задачи
+        end
+        Note over M,Q: Монитор каждого пода проверяет таймауты каждые 3 секунды.<br/>Просроченные активные задачи → FAILED.<br/>Retention очищает старые завершённые записи из того же JSON.
+    and Кастомный оператор ждёт результат
+        loop До финального статуса
+            A->>L: GET /tasks/T/status
+            L->>API: Запрос может попасть на другой под
+            API->>Q: GET общего JSON
+            Q-->>API: Статус, прогресс, ETA, error
+            API-->>A: Текущее состояние задачи
+        end
+    end
+
+    W->>Q: CAS: последняя проверка отмены → FINALIZING
+    Note over W,Q: Если отмена уже принята — ABORTED, _SUCCESS не публикуется.<br/>Если задача просрочена — FAILED, завершение запрещено.
+    W->>S: Сохранить _SUCCESS
+    W->>Q: CAS: FINALIZING → DONE
+    Note over W,Q: При временной ошибке S3 повторяется сохранение статуса.<br/>Инференс повторно не запускается; существующий FAILED не заменяется.
+    A->>L: GET /tasks/T/status
+    L->>API: Прочитать итог
+    API->>Q: GET
+    Q-->>API: DONE
+    API-->>A: DONE
+    A->>S: Следующая таска читает выходные parquet
+    S-->>A: Рассчитанные данные
+    A->>H: Записать результат обратно в Hadoop

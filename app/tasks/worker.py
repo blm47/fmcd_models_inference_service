@@ -1,6 +1,6 @@
 """Фоновый инференс с отменой через S3 и отдельным heartbeat.
 
-Отмена кооперативная: уже начатый GPU forward-pass завершается, после чего
+Отмена кооперативная: уже начатый чанк инференса завершается, после чего
 его результат не записывается, если поступила отмена. Перед записью _SUCCESS
 TaskStore фиксирует переход в FINALIZING или принимает последнюю отмену.
 Heartbeat показывает доступность исполнителя, а не движение прогресса.
@@ -8,13 +8,12 @@ Heartbeat показывает доступность исполнителя, а
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+import traceback
+from typing import TYPE_CHECKING, Any
 
-from app.tasks.cancellation import CancellationRegistry
-from app.tasks.state import TaskState, TaskStatus, TaskStore
+from app.tasks.state import TERMINAL_STATUSES, TaskState, TaskStatus, TaskStore
 
 if TYPE_CHECKING:
     from app.core.config import Settings
@@ -26,14 +25,40 @@ def _keep_heartbeat(
     task_id: str,
     store: TaskStore,
     stop: threading.Event,
-    logger: logging.Logger,
+    logger: Any,
+    lost: threading.Event | None = None,
 ) -> None:
     """Не блокирует heartbeat на долгом чтении, forward-pass или записи чанка."""
     while not stop.wait(store.heartbeat_interval_sec):
         try:
-            store.heartbeat(task_id)
+            if store.heartbeat(task_id) is False:
+                if lost is not None:
+                    lost.set()
+                return
         except Exception:
-            logger.exception("Задача %s: не удалось обновить heartbeat", task_id)
+            logger.error(
+                (f"Задача {task_id}: не удалось обновить heartbeat") + "\n" + traceback.format_exc()
+            )
+
+
+def _save_status(store, task_id, status, error, stop, logger) -> bool:
+    """Сохраняет итог до подтверждения S3; повтор не запускает инференс заново."""
+    while True:
+        try:
+            if store.set_status(task_id, status, error=error) is False:
+                logger.warn(
+                    f"Задача {task_id}: итог {status.value} не принят, уже сохранён другой статус"
+                )
+                return False
+            return True
+        except Exception:
+            logger.error(
+                (f"Задача {task_id}: не удалось сохранить {status.value}; ожидается повтор")
+                + "\n"
+                + traceback.format_exc()
+            )
+            if stop.wait(store.config.poll_interval_sec):
+                return False
 
 
 def run_task(
@@ -41,9 +66,9 @@ def run_task(
     bundle: ModelBundle,
     settings: Settings,
     store: TaskStore,
-    cancellation: CancellationRegistry,
+    stop: threading.Event,
     s3_client: S3Client,
-    logger: logging.Logger,
+    logger: Any,
 ) -> None:
     task_id = task.task_id
     processed_rows = 0
@@ -53,26 +78,33 @@ def run_task(
     heartbeat_stop = threading.Event()
     heartbeat_thread = None
     heartbeat_started = False
+    ownership_lost = threading.Event()
+
+    def check_shutdown() -> None:
+        if stop.is_set():
+            raise RuntimeError("pod_shutdown: под получил сигнал остановки")
+        if ownership_lost.is_set():
+            raise RuntimeError("task_not_active: задача завершена по таймауту")
 
     def cancelled() -> bool:
-        # Локальный флаг ускоряет отмену на своём поде; S3 доставляет её с других.
-        return cancellation.is_cancelled(task_id) or store.cancellation_requested(task_id)
+        check_shutdown()
+        return store.cancellation_requested(task_id)
 
     def abort() -> None:
         store.update_progress(task_id, processed_rows, inference_elapsed_sec)
-        store.set_status(task_id, TaskStatus.ABORTED)
-        logger.info("Задача %s отменена: processed_rows=%s", task_id, processed_rows)
+        if _save_status(store, task_id, TaskStatus.ABORTED, None, stop, logger):
+            logger.info(f"Задача {task_id} отменена: processed_rows={processed_rows}")
 
     try:
         heartbeat_thread = threading.Thread(
             target=_keep_heartbeat,
-            args=(task_id, store, heartbeat_stop, logger),
+            args=(task_id, store, heartbeat_stop, logger, ownership_lost),
             name=f"task-heartbeat-{task_id}",
             daemon=True,
         )
         heartbeat_thread.start()
         heartbeat_started = True
-        logger.info("Задача %s начата: total_rows=%s", task_id, task.total_rows)
+        logger.info(f"Задача {task_id} начата: total_rows={task.total_rows}")
 
         if cancelled():
             abort()
@@ -81,6 +113,10 @@ def run_task(
         from app.models.inference import run_inference_on_chunk
 
         # Ошибка инициализации также должна завершать задачу и освобождать слот.
+        if s3_client.prefix_has_results(task.s3_output_path):
+            raise ValueError(
+                "Выходной префикс не пуст; Airflow должен очистить его перед новым расчётом"
+            )
         writer = s3_client.get_writer(task.s3_output_path)
 
         for df_chunk in s3_client.iter_chunks(task.s3_input_path, settings.inference.chunk_size):
@@ -90,7 +126,7 @@ def run_task(
 
             started = time.perf_counter()
             result_chunk = run_inference_on_chunk(
-                df_chunk, bundle, settings.inference.infer_batch_size
+                df_chunk, bundle, settings.inference.infer_batch_size, check_shutdown
             )
             inference_elapsed_sec += time.perf_counter() - started
 
@@ -101,45 +137,45 @@ def run_task(
             writer.write_chunk(result_chunk)
             processed_rows += len(df_chunk)
 
-            if time.monotonic() - last_progress_flush >= settings.task.progress_update_interval_sec:
+            if (
+                time.monotonic() - last_progress_flush
+                >= settings.task_store.progress_update_interval_sec
+            ):
                 store.update_progress(task_id, processed_rows, inference_elapsed_sec)
                 last_progress_flush = time.monotonic()
 
-        if cancellation.is_cancelled(task_id):
-            abort()
-            return
+        check_shutdown()
 
         # Проверка отмены и решение о завершении выполняются в одной мутации S3.
         # После FINALIZING API уже не принимает отмену: пишется маркер успеха.
         if not store.prepare_completion(task_id, processed_rows, inference_elapsed_sec):
-            logger.info("Задача %s: завершение отменено", task_id)
+            logger.info(f"Задача {task_id}: завершение отменено или задача просрочена")
             return
 
+        check_shutdown()
         writer.close()
         success_written = True
         # Запись DONE идемпотентна. Ошибка PUT статуса после публикации результата
         # не должна превращать успешно завершённый инференс в FAILED.
-        for attempt in range(3):
-            try:
-                store.set_status(task_id, TaskStatus.DONE)
-                break
-            except Exception:
-                if attempt == 2:
-                    raise
-                logger.warning("Задача %s: повтор сохранения DONE", task_id, exc_info=True)
-                time.sleep(1.0)
-        logger.info("Задача %s завершена: processed_rows=%s", task_id, processed_rows)
+        if _save_status(store, task_id, TaskStatus.DONE, None, stop, logger):
+            logger.info(f"Задача {task_id} завершена: processed_rows={processed_rows}")
 
     except FileNotFoundError as exc:
-        logger.exception("Задача %s: путь S3 стал недоступен", task_id)
+        logger.error((f"Задача {task_id}: путь S3 стал недоступен") + "\n" + traceback.format_exc())
         if not success_written:
-            store.set_status(task_id, TaskStatus.FAILED, error=f"s3_path_not_found: {exc}")
+            _save_status(
+                store, task_id, TaskStatus.FAILED, f"s3_path_not_found: {exc}", stop, logger
+            )
     except Exception as exc:
         if success_written:
-            logger.exception("Задача %s: результат опубликован, сохранение DONE не подтверждено", task_id)
+            logger.error(
+                (f"Задача {task_id}: результат опубликован, сохранение DONE не подтверждено")
+                + "\n"
+                + traceback.format_exc()
+            )
         else:
-            logger.exception("Задача %s упала с ошибкой", task_id)
-            store.set_status(task_id, TaskStatus.FAILED, error=str(exc))
+            logger.error((f"Задача {task_id} упала с ошибкой") + "\n" + traceback.format_exc())
+            _save_status(store, task_id, TaskStatus.FAILED, str(exc), stop, logger)
     finally:
         heartbeat_stop.set()
         if heartbeat_started and heartbeat_thread is not None:
@@ -147,10 +183,58 @@ def run_task(
             # не разрешает heartbeat менять терминальное состояние задачи.
             heartbeat_thread.join(timeout=1.0)
             if heartbeat_thread.is_alive():
-                logger.warning("Задача %s: heartbeat ожидает завершения запроса S3", task_id)
+                logger.warn(f"Задача {task_id}: heartbeat ожидает завершения запроса S3")
         if not success_written:
-            logger.warning(
-                "Задача %s: _SUCCESS не записан (частичная или прерванная загрузка)",
-                task_id,
+            logger.warn(
+                f"Задача {task_id}: _SUCCESS не записан (частичная или прерванная загрузка)"
             )
-        cancellation.cleanup(task_id)
+
+
+def consume_queue(store, models, settings, s3_client, pod_id, stop, logger) -> None:
+    """Один поток последовательно выполняет задачи; занятый GPU не блокирует API."""
+    current_task = None
+    while not stop.is_set():
+        try:
+            if current_task is not None:
+                task = store.get(current_task.task_id)
+                if task is None or task.status not in TERMINAL_STATUSES:
+                    # Worker уже вышел, но финальный статус не подтверждён.
+                    # Не запускаем тот же инференс повторно и не теряем занятый слот.
+                    stop.wait(settings.task_store.poll_interval_sec)
+                    continue
+                current_task = None
+            current_task = store.claim_next(pod_id, set(models))
+            if current_task is not None:
+                run_task(
+                    current_task,
+                    models[current_task.model_name],
+                    settings,
+                    store,
+                    stop,
+                    s3_client,
+                    logger,
+                )
+                continue
+        except Exception:
+            logger.error(
+                (f"Под {pod_id}: ошибка обработки очереди; следующая проверка повторит чтение")
+                + "\n"
+                + traceback.format_exc()
+            )
+        stop.wait(settings.task_store.poll_interval_sec)
+
+
+def monitor_queue(store, stop, logger) -> None:
+    """Проверяет таймауты независимо от занятости GPU на этом поде."""
+    next_cleanup = time.monotonic()
+    while not stop.is_set():
+        try:
+            store.fail_stale()
+            if time.monotonic() >= next_cleanup:
+                store.cleanup()
+                next_cleanup = time.monotonic() + store.config.cleanup_interval_sec
+        except Exception:
+            logger.error(
+                ("Не удалось проверить таймауты очереди S3") + "\n" + traceback.format_exc()
+            )
+        stop.wait(store.config.poll_interval_sec)

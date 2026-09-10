@@ -4,14 +4,19 @@ metadata:
   name: {{ .Release.Name }}-fmcd-inference
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: fmcd-inference
   template:
     metadata:
+      annotations:
+        checksum/config: {{ required "Передайте serviceConfig" .Values.serviceConfig | sha256sum }}
       labels:
         app: fmcd-inference
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       nodeSelector:
         {{- toYaml .Values.nodeSelector | nindent 8 }}
       containers:

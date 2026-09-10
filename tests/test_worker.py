@@ -1,11 +1,11 @@
-import logging
 import sys
 import threading
 import types
 import unittest
 from unittest.mock import Mock, patch
 
-from app.tasks.cancellation import CancellationRegistry
+from logger_stub import make_logger
+
 from app.tasks.state import TaskState, TaskStatus
 from app.tasks.worker import _keep_heartbeat, run_task
 
@@ -22,14 +22,14 @@ class WorkerTests(unittest.TestCase):
         )
         self.settings = types.SimpleNamespace(
             inference=types.SimpleNamespace(chunk_size=2, infer_batch_size=1),
-            task=types.SimpleNamespace(progress_update_interval_sec=120),
+            task_store=types.SimpleNamespace(progress_update_interval_sec=120),
         )
-        self.cancellation = CancellationRegistry()
-        self.cancel_event = self.cancellation.create(self.task.task_id)
-        self.logger = Mock(spec=logging.Logger)
+        self.cancel_event = threading.Event()
+        self.logger = make_logger()
         self.remote_cancel = False
         self.heartbeat_received = threading.Event()
         self.store = Mock()
+        self.store.config.poll_interval_sec = 0.001
         self.store.heartbeat_interval_sec = 0.01
         self.store.heartbeat.side_effect = lambda task_id: self.heartbeat_received.set()
         self.store.cancellation_requested.side_effect = lambda task_id: self.remote_cancel
@@ -38,11 +38,12 @@ class WorkerTests(unittest.TestCase):
         self.store.prepare_completion.side_effect = self._prepare_completion
         self.writer = Mock()
         self.s3 = Mock()
+        self.s3.prefix_has_results.return_value = False
         self.s3.get_writer.return_value = self.writer
         self.s3.iter_chunks.return_value = [[1, 2], [3, 4]]
 
         inference_module = types.ModuleType("app.models.inference")
-        self.infer = Mock(side_effect=lambda chunk, bundle, batch_size: chunk)
+        self.infer = Mock(side_effect=lambda chunk, bundle, batch_size, checkpoint: chunk)
         inference_module.run_inference_on_chunk = self.infer
         inference_patch = patch.dict(sys.modules, {"app.models.inference": inference_module})
         inference_patch.start()
@@ -76,12 +77,16 @@ class WorkerTests(unittest.TestCase):
 
     def run_worker(self):
         run_task(
-            self.task, object(), self.settings, self.store,
-            self.cancellation, self.s3, self.logger,
+            self.task,
+            object(),
+            self.settings,
+            self.store,
+            self.cancel_event,
+            self.s3,
+            self.logger,
         )
 
     def assert_worker_stopped(self):
-        self.assertFalse(self.cancellation.request_cancel(self.task.task_id))
         self.assertTrue(self.heartbeat_threads)
         self.assertTrue(all(not thread.is_alive() for thread in self.heartbeat_threads))
 
@@ -113,7 +118,7 @@ class WorkerTests(unittest.TestCase):
     def test_remote_abort_during_inference_does_not_write_current_chunk(self):
         calls = 0
 
-        def infer(chunk, bundle, batch_size):
+        def infer(chunk, bundle, batch_size, checkpoint):
             nonlocal calls
             calls += 1
             if calls == 2:
@@ -146,15 +151,36 @@ class WorkerTests(unittest.TestCase):
         self.writer.close.assert_not_called()
         self.assert_worker_stopped()
 
-    def test_local_abort_during_final_write_also_prevents_success_marker(self):
+    def test_shutdown_during_final_write_sets_failed(self):
         self.s3.iter_chunks.return_value = [[1, 2]]
         self.writer.write_chunk.side_effect = lambda chunk: self.cancel_event.set()
         self.run_worker()
 
-        self.assertEqual(self.task.status, TaskStatus.ABORTED)
-        self.assertEqual(self.task.processed_rows, 2)
+        self.assertEqual(self.task.status, TaskStatus.FAILED)
+        self.assertIn("pod_shutdown", self.task.error)
         self.writer.close.assert_not_called()
         self.store.prepare_completion.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_shutdown_between_gpu_batches_stops_before_output(self):
+        def infer(chunk, bundle, batch_size, checkpoint):
+            self.cancel_event.set()
+            checkpoint()
+            self.fail("После shutdown новый GPU batch запускаться не должен")
+
+        self.infer.side_effect = infer
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.FAILED)
+        self.assertIn("pod_shutdown", self.task.error)
+        self.writer.write_chunk.assert_not_called()
+        self.writer.close.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_shutdown_before_worker_start_sets_failed(self):
+        self.cancel_event.set()
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.FAILED)
+        self.s3.get_writer.assert_not_called()
         self.assert_worker_stopped()
 
     def test_success_marker_is_written_only_after_completion_decision(self):
@@ -203,17 +229,17 @@ class WorkerTests(unittest.TestCase):
 
     def test_published_result_is_never_marked_failed_on_status_delivery_error(self):
         self.store.set_status.side_effect = OSError("status S3 unavailable")
+        self.writer.close.side_effect = lambda: self.cancel_event.set()
         with patch("app.tasks.worker.time.sleep"):
             self.run_worker()
-        self.assertEqual(self.task.status, TaskStatus.FINALIZING)
-        self.assertEqual(self.store.set_status.call_count, 3)
+        self.assertEqual(self.store.set_status.call_count, 1)
         for call in self.store.set_status.call_args_list:
             self.assertEqual(call.args[1], TaskStatus.DONE)
         self.writer.close.assert_called_once_with()
         self.assert_worker_stopped()
 
     def test_heartbeat_continues_while_inference_is_busy(self):
-        def infer(chunk, bundle, batch_size):
+        def infer(chunk, bundle, batch_size, checkpoint):
             self.assertTrue(self.heartbeat_received.wait(timeout=2))
             self.assertEqual(self.task.processed_rows, 0)
             return chunk
@@ -252,29 +278,42 @@ class WorkerTests(unittest.TestCase):
         self.assert_worker_stopped()
 
     def test_failed_status_write_still_stops_heartbeat_and_releases_local_slot(self):
-        self.infer.side_effect = RuntimeError("inference failed")
+        def fail(*args):
+            self.cancel_event.set()
+            raise RuntimeError("inference failed")
+
+        self.infer.side_effect = fail
         self.store.set_status.side_effect = OSError("status storage unavailable")
 
-        with self.assertRaisesRegex(OSError, "status storage unavailable"):
-            self.run_worker()
+        self.run_worker()
 
         self.writer.close.assert_not_called()
         self.assert_worker_stopped()
 
 
 class HeartbeatTests(unittest.TestCase):
+    def test_terminal_task_signals_worker_to_stop(self):
+        stop = Mock()
+        stop.wait.return_value = False
+        store = Mock()
+        store.heartbeat.return_value = False
+        lost = threading.Event()
+        _keep_heartbeat("task-1", store, stop, Mock(), lost)
+        self.assertTrue(lost.is_set())
+        store.heartbeat.assert_called_once_with("task-1")
+
     def test_temporary_storage_failure_is_retried_until_stop(self):
         stop = Mock()
         stop.wait.side_effect = [False, False, True]
         store = Mock()
         store.heartbeat_interval_sec = 30
         store.heartbeat.side_effect = [OSError("temporary S3 failure"), None]
-        logger = Mock(spec=logging.Logger)
+        logger = make_logger()
 
         _keep_heartbeat("task-1", store, stop, logger)
 
         self.assertEqual(store.heartbeat.call_count, 2)
-        logger.exception.assert_called_once()
+        logger.error.assert_called_once()
         self.assertEqual(stop.wait.call_count, 3)
         stop.wait.assert_called_with(30)
 

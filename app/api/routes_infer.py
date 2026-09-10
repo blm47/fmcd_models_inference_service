@@ -1,131 +1,89 @@
-"""
-POST /infer — единственный универсальный эндпоинт инференса (с полем model_name).
+"""Приём заявки в общую очередь; GPU работает независимо от HTTP-запроса."""
 
-Синхронная часть (до ответа клиенту):
-  1. Найти модель в dict моделей по model_name (404, если нет).
-  2. Провалидировать наличие всех фич модели
-     (404, если сам префикс не существует в S3; 422, если фич не хватает).
-  3. Попытаться атомарно занять "слот" активной задачи (409, если уже занято).
-Всё, что после — уходит в BackgroundTasks (сам инференс).
-"""
+from urllib.parse import urlsplit
 
-import logging
+from fastapi import APIRouter, Depends, HTTPException
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from app.api.schemas import InferRequest, TaskAcceptedResponse
+from app.deps import get_logger, get_models, get_s3_client, get_settings, get_task_store
+from app.tasks.state import prefixes_overlap
 
-from app.api.schemas import (
-    InferRequest,
-    S3PathNotFoundResponse,
-    TaskAcceptedResponse,
-    TaskBusyResponse,
-    ValidationErrorResponse,
-)
-from app.core.logging import setup_logging
-from app.core.config import Settings
-from app.deps import (
-    get_cancellation_registry,
-    get_models,
-    get_s3_client,
-    get_settings,
-    get_task_manager,
-    get_task_store,
-)
-from app.models.registry import ModelBundle, get_model_bundle
-from app.models.validation import validate_input_parquet
-from app.storage.s3_client import S3Client
-from app.tasks.cancellation import CancellationRegistry
-from app.tasks.manager import TaskAlreadyRunningError, TaskManager
-from app.tasks.state import TaskStore
-from app.tasks.worker import run_task
-
-# logger = logging.getLogger(__name__)
 router = APIRouter(tags=["inference"])
 
 
-@router.post(
-    "/infer",
-    response_model=TaskAcceptedResponse,
-    responses={
-        404: {"model": S3PathNotFoundResponse},
-        409: {"model": TaskBusyResponse},
-        422: {"model": ValidationErrorResponse},
-    },
-    status_code=202,
-)
+def validate_paths(request, settings) -> None:
+    for path, bucket in (
+        (request.s3_input_path, settings.s3.bucket_in),
+        (request.s3_output_path, settings.s3.bucket_out),
+    ):
+        parsed = urlsplit(path)
+        if (
+            parsed.scheme != "s3"
+            or parsed.netloc != bucket
+            or not parsed.path.strip("/")
+            or parsed.query
+            or parsed.fragment
+            or any(part in (".", "..", "") for part in parsed.path[1:].split("/"))
+        ):
+            raise HTTPException(422, "Ожидается S3-префикс внутри настроенного бакета")
+    system_path = f"s3://{settings.s3.bucket_out}/{settings.task_store.state_key}"
+    if prefixes_overlap(request.s3_output_path, system_path):
+        raise HTTPException(422, "Выходной префикс пересекается с файлом очереди")
+    if prefixes_overlap(request.s3_input_path, request.s3_output_path):
+        raise HTTPException(422, "Входной и выходной префиксы не должны пересекаться")
+
+
+@router.post("/infer", response_model=TaskAcceptedResponse, status_code=202)
 def infer(
     request: InferRequest,
-    background_tasks: BackgroundTasks,
-    settings: Settings = Depends(get_settings),
-    models: dict[str, ModelBundle] = Depends(get_models),
-    task_manager: TaskManager = Depends(get_task_manager),
-    task_store: TaskStore = Depends(get_task_store),
-    cancellation: CancellationRegistry = Depends(get_cancellation_registry),
-    s3_client: S3Client = Depends(get_s3_client),
-    logger: logging.Logger = Depends(setup_logging),
+    settings=Depends(get_settings),
+    models=Depends(get_models),
+    store=Depends(get_task_store),
+    s3_client=Depends(get_s3_client),
+    logger=Depends(get_logger),
 ):
-    try:
-        bundle = get_model_bundle(models, request.model_name)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    # Нормализуем завершающий слеш до сравнения ключа идемпотентности.
+    request.s3_input_path = request.s3_input_path.rstrip("/")
+    request.s3_output_path = request.s3_output_path.rstrip("/")
+    validate_paths(request, settings)
+    existing = store.find_request(
+        request.idempotency_key, request.model_name, request.s3_input_path, request.s3_output_path
+    )
+    if existing is not None:
+        return existing
+    if request.model_name not in models:
+        raise HTTPException(404, f"Модель {request.model_name} не найдена")
+
+    from app.models.validation import validate_input_parquet
 
     try:
-        validation = validate_input_parquet(request.s3_input_path, bundle, s3_client)
+        validation = validate_input_parquet(
+            request.s3_input_path, models[request.model_name], s3_client
+        )
     except FileNotFoundError as exc:
-        # pyarrow.dataset кидает FileNotFoundError, если под s3_input_path
-        # нет ни одного part-*.parquet файла
-        logger.warning("Входной префикс не найден в S3: %s", request.s3_input_path)
-        raise HTTPException(
-            status_code=404,
-            detail=S3PathNotFoundResponse(
-                s3_path=request.s3_input_path,
-                detail=str(exc),
-            ).dict(),
-        )
-
+        logger.warn(f"Входной префикс не найден в S3: {request.s3_input_path}")
+        raise HTTPException(404, "Входной префикс не найден в S3") from exc
     if not validation.is_valid:
-        raise HTTPException(
-            status_code=422,
-            detail=ValidationErrorResponse(missing_columns=validation.missing_columns).dict(),
+        raise HTTPException(422, {"missing_columns": validation.missing_columns})
+    if s3_client.prefix_has_results(request.s3_output_path):
+        # Пока шла валидация, другой под мог принять и начать тот же запрос.
+        existing = store.find_request(
+            request.idempotency_key,
+            request.model_name,
+            request.s3_input_path,
+            request.s3_output_path,
         )
-
-    if s3_client.prefix_has_parquet(request.s3_output_path):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "output_prefix_not_empty",
-                "s3_output_path": request.s3_output_path,
-                "detail": f"Префикс {request.s3_output_path} уже существует в S3. "
-                    f"Сервис не перезаписывает существующие данные.",
-            }
-        )
-
-    try:
-        task = task_manager.try_start_task(
-            model_name=request.model_name,
-            s3_input_path=request.s3_input_path,
-            s3_output_path=request.s3_output_path,
-            total_rows=validation.total_rows,
-        )
-    except TaskAlreadyRunningError as exc:
-        active = exc.active_task
-        # На ЭТОМ поде (task_manager.pod_id) уже есть активная задача -
-        # отбой 409. Задача на ДРУГОМ поде до сюда не долетает: try_start_task
-        # проверяет активность строго в разрезе pod_id (см. TaskManager/TaskStore).
-        raise HTTPException(
-            status_code=409,
-            detail=TaskBusyResponse(
-                task_id=active.task_id,
-                pod_id=active.pod_id,
-                status=active.status,
-                progress_pct=active.progress_pct,
-                eta_seconds=active.eta_seconds,
-            ).dict(),
-        )
-
-    background_tasks.add_task(
-        run_task, task, bundle, settings, task_store, cancellation, s3_client, logger
+        if existing is not None:
+            return existing
+        raise HTTPException(422, "Выходной префикс содержит parquet или _SUCCESS")
+    task = store.enqueue(
+        request.idempotency_key,
+        request.model_name,
+        request.s3_input_path,
+        request.s3_output_path,
+        validation.total_rows,
     )
-
-    return TaskAcceptedResponse(
-        task_id=task.task_id, pod_id=task.pod_id, status=task.status, total_rows=task.total_rows
+    logger.info(
+        f"Заявка {task.task_id} сохранена: модель={task.model_name}, статус={task.status.value}"
     )
+    return task

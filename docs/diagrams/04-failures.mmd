@@ -1,0 +1,48 @@
+sequenceDiagram
+    autonumber
+    participant K as Kubernetes
+    participant W as GPU worker
+    participant M as Монитор любого работающего пода
+    participant Q as S3 — общий JSON
+    participant S as S3 — выходной префикс
+    participant A as Airflow — оператор ожидания
+
+    alt Исключение при чтении, расчёте или записи
+        W->>W: Зафиксировать ошибку через logger.error
+        W->>Q: CAS: FAILED + причина ошибки
+    else SIGTERM / SIGINT
+        K->>W: Установить сигнал shutdown
+        W->>W: Завершить текущую операцию
+        W->>W: На границе GPU-батча / чанка проверить сигнал
+        W->>Q: CAS: FAILED, error = pod_shutdown
+        Note over K,W: Под не начинает новые расчёты.<br/>Grace period в Helm — 120 секунд.<br/>При SIGKILL или OOM итог фиксирует монитор.
+    else Авария или зависание
+        loop Монитор проверяет JSON каждые 3 секунды
+            M->>Q: GET состояния
+        end
+        alt Нет heartbeat 180 секунд
+            M->>Q: CAS: FAILED, error = heartbeat_timeout
+        else Нет прогресса 1800 секунд, heartbeat ещё жив
+            M->>Q: CAS: FAILED, error = progress_timeout
+        end
+        Note over M,Q: Проверяются RUNNING, ABORTING и FINALIZING.<br/>QUEUED и финальные статусы не изменяются.<br/>Если нет живых подов или доступа к S3, запись откладывается до восстановления.
+    else Отмена через API
+        A->>Q: Через API: POST /tasks/T/abort
+        alt Задача ещё QUEUED
+            Q->>Q: CAS: ABORTED
+        else Задача RUNNING
+            Q->>Q: CAS: ABORTING + cancel_requested
+            W->>Q: Прочитать запрос отмены
+            W->>Q: CAS: ABORTED после текущей операции
+        else Уже FINALIZING
+            Q-->>A: Через API: 409, отмена недоступна
+        end
+    end
+
+    A->>Q: Через API: прочитать финальный статус
+    Q-->>A: FAILED или ABORTED
+    A->>S: Очистить выходной префикс и _SUCCESS
+    Note over A,S: Системный JSON очереди не удалять.<br/>Политика очистки и повтора реализуется на стороне Airflow.
+    A->>Q: Через POST /infer: новый ключ, прежние физические пути
+    Q->>Q: CAS: новая задача с новым task_id, QUEUED
+    Note over W,S: Ограничение: уже отправленный PUT старого worker может завершиться поздно.<br/>CAS JSON не блокирует запись parquet. При одном пути и только S3<br/>строгая изоляция попыток не гарантируется.

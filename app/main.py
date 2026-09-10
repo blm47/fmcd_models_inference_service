@@ -1,102 +1,150 @@
-"""
-Точка входа FastAPI-приложения.
+"""Инициализация настроек, моделей и единственного потока очереди на поде."""
 
-lifespan выполняет всю "тяжёлую" инициализацию один раз при старте пода:
-  - загрузка конфига (env + config/models.yaml)
-  - загрузка всех моделей из списка models[] на GPU + препроцессинг-
-    артефактов в dict[str, ModelBundle]
-  - создание TaskStore/CancellationRegistry/TaskManager/S3Client
-
-Всё складывается в app.state, роуты достают через Depends (app/deps.py).
-Ни один тяжёлый объект не создаётся на каждый запрос.
-"""
-
-from contextlib import asynccontextmanager
+import asyncio
 import os
 import socket
+import threading
+import traceback
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.api.routes_infer import router as infer_router
 from app.api.routes_tasks import router as tasks_router
 from app.core.config import load_settings
 from app.core.logging import setup_logging
-from app.tasks.backends.factory import create_task_storage_backend
-from app.models.loader import load_all_models
-from app.storage.s3_client import S3Client
-from app.tasks.cancellation import CancellationRegistry
-from app.tasks.manager import TaskManager
-from app.tasks.maintenance import TaskMaintenance
-from app.tasks.state import TaskStore
+from app.core.shutdown import install_shutdown_handlers, restore_shutdown_handlers
+from app.tasks.state import QueueConflictError, TaskStore
+from app.tasks.worker import consume_queue, monitor_queue
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
     logger = setup_logging()
-
+    app.state.logger = logger
+    client = None
+    stop = threading.Event()
+    previous_handlers = {}
+    started_threads = []
     try:
         settings = load_settings()
+        s3 = settings.s3
+        queue = settings.task_store
+        client = boto3.client(
+            "s3",
+            endpoint_url=s3.endpoint_url,
+            aws_access_key_id=s3.access_key,
+            aws_secret_access_key=s3.secret_key,
+            region_name=s3.region,
+            use_ssl=s3.use_ssl,
+            verify=s3.verify_ssl,
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=queue.connect_timeout_sec,
+                read_timeout=queue.read_timeout_sec,
+                # Повторы CAS управляются TaskStore, а не скрытым retry SDK.
+                retries={"mode": "standard", "total_max_attempts": 1},
+            ),
+        )
+        store = TaskStore(client, s3.bucket_out, queue, logger)
+        await asyncio.to_thread(store.initialize)
+        from app.models.loader import load_all_models
+        from app.storage.s3_client import S3Client
 
-        models = load_all_models(settings.models, settings.inference, logger)
-
-        task_storage_backend = create_task_storage_backend(settings.task_store, settings.s3)
-        task_storage_backend.initialize()
-
-        pod_id = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME", socket.gethostname())
-
+        models = await asyncio.to_thread(
+            load_all_models, settings.models, settings.inference, logger
+        )
+        s3_client = S3Client(s3, logger)
+        pod_id = os.environ.get("POD_NAME") or socket.gethostname()
+        consumer = threading.Thread(
+            target=consume_queue,
+            args=(store, models, settings, s3_client, pod_id, stop, logger),
+            name="inference-queue",
+            daemon=True,
+        )
+        monitor = threading.Thread(
+            target=monitor_queue, args=(store, stop, logger), name="queue-monitor", daemon=True
+        )
         app.state.settings = settings
         app.state.models = models
-        app.state.task_store = TaskStore(
-            task_storage_backend,
-            heartbeat_interval_sec=settings.task_store.heartbeat_interval_sec,
-            heartbeat_timeout_sec=settings.task_store.heartbeat_timeout_sec,
-        )
-        app.state.cancellation_registry = CancellationRegistry()
-        app.state.task_manager = TaskManager(
-            app.state.task_store, app.state.cancellation_registry, pod_id=pod_id
-        )
-        app.state.s3_client = S3Client(settings.s3)
-        app.state.pod_id = pod_id
-
-        # Другой процесс не должен помечать старого исполнителя как FAILED только
-        # по имени пода. API исключает его из активных после истечения heartbeat.
-        maintenance = TaskMaintenance(app.state.task_store, settings.task_store.cleanup_interval_sec)
-        maintenance.start()
-
-        logger.info(f"Сервис запущен на поде pod_id={pod_id}")
-
+        app.state.task_store = store
+        app.state.s3_client = s3_client
+        app.state.stop = stop
+        app.state.consumer = consumer
+        app.state.monitor = monitor
+        previous_handlers = install_shutdown_handlers(stop, logger)
+        monitor.start()
+        started_threads.append(monitor)
+        consumer.start()
+        started_threads.append(consumer)
+        logger.info(f"Сервис запущен на поде {pod_id}")
     except Exception:
-        logger.exception("Service initialization failed")
+        stop.set()
+        for thread in started_threads:
+            await asyncio.to_thread(thread.join)
+        restore_shutdown_handlers(previous_handlers)
+        if client is not None:
+            client.close()
+        logger.error(("Не удалось инициализировать сервис") + "\n" + traceback.format_exc())
         raise
 
     try:
         yield
     finally:
-        maintenance.stop()
-    # На shutdown специально ничего не чистим: если под убивают во время
-    # активной задачи, это внештатная ситуация уровня K8s (readiness/liveness),
-    # а не штатный сценарий graceful shutdown в v1.
+        stop.set()
+        # Ждём текущую операцию перед закрытием S3; K8s ограничивает срок shutdown.
+        await asyncio.to_thread(consumer.join)
+        await asyncio.to_thread(monitor.join)
+        restore_shutdown_handlers(previous_handlers)
+        client.close()
+        logger.info(f"Сервис остановлен на поде {pod_id}")
 
 
 app = FastAPI(title="FMCD Inference Service", lifespan=lifespan)
 app.include_router(infer_router)
 app.include_router(tasks_router)
-# app = FastAPI(title="FMCD Inference Service")
+
+
+@app.exception_handler(QueueConflictError)
+async def queue_conflict(request: Request, exc: QueueConflictError):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+async def storage_unavailable(request: Request, exc: Exception):
+    request.app.state.logger.error(
+        (f"Запрос к очереди S3 не завершён: {exc}")
+        + "\n"
+        + "".join(traceback.format_exception(exc))
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Очередь S3 недоступна; повторите запрос с тем же ключом идемпотентности"
+        },
+    )
+
+
+for error_type in (ClientError, BotoCoreError, TimeoutError):
+    app.add_exception_handler(error_type, storage_unavailable)
 
 
 @app.get("/health")
-def health():
+@app.get("/healthz/readiness")
+@app.get("/healthz/liveness")
+def health(request: Request):
+    consumer = getattr(request.app.state, "consumer", None)
+    monitor = getattr(request.app.state, "monitor", None)
+    stop = getattr(request.app.state, "stop", None)
+    if (
+        consumer is None
+        or not consumer.is_alive()
+        or monitor is None
+        or not monitor.is_alive()
+        or stop.is_set()
+    ):
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
     return {"status": "ok"}
-
-
-@app.get('/healthz/readiness')
-async def route_readiness_probe():
-    """Проверка готовности сервиса (readiness probe)."""
-    return {'details': 'OK'}
-
-
-@app.get('/healthz/liveness')
-async def route_liveness_probe():
-    """Проверка доступности сервиса (liveness probe)."""
-    return {'details': 'OK'}

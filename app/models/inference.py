@@ -10,12 +10,13 @@ S3-записи), а разбиение чанка на INFER_BATCH_SIZE под-
 остаётся внутренним делом этой функции.
 """
 
+from collections.abc import Callable
+
 import numpy as np
 import pandas as pd
 import torch
 
 from app.models.registry import ModelBundle
-from app.core.profiling_snippet import StageTimer
 
 
 def logit(p: np.ndarray) -> np.ndarray:
@@ -32,6 +33,7 @@ def run_inference_on_chunk(
     df_chunk: pd.DataFrame,
     bundle: ModelBundle,
     infer_batch_size: int,
+    check_shutdown: Callable[[], None],
 ) -> pd.DataFrame:
     """
     Возвращает DataFrame с результатами (ID_COLS + d_prob_*/f_pred_*/
@@ -44,8 +46,8 @@ def run_inference_on_chunk(
 
     with torch.no_grad():
         for start in range(0, len(df_chunk), infer_batch_size):
-
-            sub = df_chunk.iloc[start:start + infer_batch_size]
+            check_shutdown()
+            sub = df_chunk.iloc[start : start + infer_batch_size]
 
             fmcd_batch = pandas_chunk_to_fmcd_batch(
                 sub, bundle.schema, bundle.num_cols, bundle.cat_cols
@@ -58,24 +60,25 @@ def run_inference_on_chunk(
             for k, col in enumerate(bundle.d_cols):
                 calib = bundle.calibrators[col]
                 d_prob_calib = log_reg(
-                    calib["intercept"], calib["coef"],
-                    np.array(logit(d_probs_raw[:, k])).reshape(-1, 1)
+                    calib["intercept"],
+                    calib["coef"],
+                    np.array(logit(d_probs_raw[:, k])).reshape(-1, 1),
                 ).reshape(1, -1)[0]
                 result[f"d_prob_{col}"] = d_prob_calib
 
             # F - безусловное: d_prob_calib * expm1(f_log)
             f_log = out.f_value_pred.cpu().float().numpy()
-            for k, (f_col, d_col) in enumerate(zip(bundle.f_cols, bundle.d_cols)):
+            for k, (f_col, d_col) in enumerate(zip(bundle.f_cols, bundle.d_cols, strict=True)):
                 result[f"f_pred_{f_col}"] = result[f"d_prob_{d_col}"] * np.expm1(f_log[:, k])
 
             # M - безусловное
             m_log = out.m_value_pred.cpu().float().numpy()
-            for k, (m_col, d_col) in enumerate(zip(bundle.m_cols, bundle.d_cols)):
+            for k, (m_col, d_col) in enumerate(zip(bundle.m_cols, bundle.d_cols, strict=True)):
                 result[f"m_pred_{m_col}"] = result[f"d_prob_{d_col}"] * np.expm1(m_log[:, k])
 
             # C - безусловное
             c_log = out.c_value_pred.cpu().float().numpy()
-            for k, (c_col, d_col) in enumerate(zip(bundle.c_cols, bundle.d_cols)):
+            for k, (c_col, d_col) in enumerate(zip(bundle.c_cols, bundle.d_cols, strict=True)):
                 result[f"c_pred_{c_col}"] = result[f"d_prob_{d_col}"] * np.expm1(c_log[:, k])
 
             result["d_count_pred"] = np.expm1(out.d_count_pred.cpu().float().numpy().squeeze(1))
@@ -83,5 +86,6 @@ def run_inference_on_chunk(
             all_results.append(pd.DataFrame(result))
 
             torch.cuda.empty_cache()
+            check_shutdown()
 
     return pd.concat(all_results, ignore_index=True)

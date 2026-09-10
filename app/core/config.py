@@ -1,21 +1,4 @@
-"""
-Централизованная конфигурация сервиса.
-
-Паттерн чтения S3-настроек — по аналогии с вашим существующим сервисом
-(BGEM3): в configs/models.yaml хранится не само значение секрета/эндпоинта,
-а ИМЯ переменной окружения, откуда его нужно прочитать. Сами значения
-приходят в контейнер как обычные переменные окружения — их туда
-прокидывает Helm (из ConfigMap для несекретных и из Secret для секретных
-значений, см. deploy/helm/templates/deployment.yaml).
-
-Почему так, а не "${VAR}"-интерполяция прямо в yaml:
-  - Явное разделение: в yaml видно, ЧТО является env-зависимым полем,
-    а в env vars — реальные значения, которые различаются по кластерам
-    (георезервирование - два кластера с разными S3-эндпоинтами).
-  - Fail-fast: если обязательная переменная не выставлена, сервис падает
-    при старте с понятной ошибкой, а не с невнятным KeyError в середине
-    инференса на 2-3 млн строк.
-"""
+"""Настройки S3 читаются из ENV, настройки сервиса — только из YAML."""
 
 import math
 import os
@@ -25,53 +8,48 @@ from pathlib import Path
 import yaml
 
 
-def _env(name: str, default: str | None = None) -> str:
-    value = os.environ.get(name, default)
-    if value is None:
-        raise RuntimeError(f"Environment variable '{name}' is required")
+def required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        raise ValueError(f"Не задана переменная окружения {name}")
     return value
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in ("1", "true", "yes", "y", "on")
+def env_bool(name: str) -> bool:
+    value = required_env(name).lower()
+    if value not in ("true", "false", "1", "0"):
+        raise ValueError(f"{name}: ожидается true, false, 1 или 0")
+    return value in ("true", "1")
 
 
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return int(value)
+def positive_integer(name: str, value: int) -> None:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name}: ожидается положительное целое число")
 
 
-def _env_float(name: str, default: float) -> float:
-    return float(os.environ.get(name, default))
-
-
-@dataclass
+@dataclass(frozen=True)
 class ModelConfig:
-    """Описание одной модели из списка models.yaml -> models[]."""
-
     name: str
     weights_path: str
     schema_path: str
     calibrators_path: str
     freq_encoding_path: str
+    id_cols: list[str]
 
 
-@dataclass
+@dataclass(frozen=True)
 class InferenceConfig:
-    device: str = "cuda"
-    infer_batch_size: int = 16
-    chunk_size: int = 100_000
+    device: str
+    infer_batch_size: int
+    chunk_size: int
+
+    def __post_init__(self):
+        for name in ("infer_batch_size", "chunk_size"):
+            positive_integer(name, getattr(self, name))
 
 
-@dataclass
+@dataclass(frozen=True)
 class S3Config:
-    """Значения читаются из env по именам, указанным в models.yaml -> s3.*_env."""
-
     endpoint_url: str
     access_key: str
     secret_key: str
@@ -82,160 +60,89 @@ class S3Config:
     verify_ssl: bool
 
 
-@dataclass
-class TaskConfig:
-    progress_update_interval_sec: int = 10
-
-
-@dataclass
+@dataclass(frozen=True)
 class TaskStoreConfig:
-    """
-    Конфигурация физического хранения состояния задач (task tracker).
+    state_key: str
+    cas_timeout_sec: float
+    cas_retry_interval_sec: float
+    poll_interval_sec: float
+    retention_months: int
+    max_pending_tasks: int
+    heartbeat_interval_sec: float
+    heartbeat_timeout_sec: float
+    progress_timeout_sec: float
+    cleanup_interval_sec: float
+    progress_update_interval_sec: float
+    connect_timeout_sec: float
+    read_timeout_sec: float
+    strip_etag_quotes: bool
 
-    backend: "s3" (сейчас) | "redis" | "postgres" (заложено на будущее -
-    смена значения не требует изменений в TaskManager/TaskStore, только
-    в фабрике create_task_storage_backend()).
-
-    retention_months читается из переменной окружения
-    TASK_STORE_RETENTION_MONTHS, по умолчанию 6.
-    """
-
-    backend: str = "s3"
-    state_key: str = "_system/fmcd_models/task_state.json"
-    lock_key: str = "_system/fmcd_models/task_state.lock"
-    lease_seconds: float = 60
-    wait_timeout_sec: float = 300
-    poll_interval_sec: float = 1.0
-    retention_months: int = 6
-    heartbeat_interval_sec: float = 30
-    heartbeat_timeout_sec: float = 180
-    cleanup_interval_sec: float = 3600
-
-    def __post_init__(self) -> None:
-        for name in (
-            "lease_seconds", "wait_timeout_sec", "poll_interval_sec",
-            "heartbeat_interval_sec", "heartbeat_timeout_sec", "cleanup_interval_sec",
-        ):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"task_store.{name} must be finite and positive")
+    def __post_init__(self):
+        for name, value in vars(self).items():
+            if name.endswith("_sec"):
+                if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"task_store.{name}: ожидается конечное положительное число")
+        for name in ("retention_months", "max_pending_tasks"):
+            positive_integer(f"task_store.{name}", getattr(self, name))
         if self.heartbeat_timeout_sec <= self.heartbeat_interval_sec:
-            raise ValueError("task_store.heartbeat_timeout_sec must exceed heartbeat_interval_sec")
-        if (
-            isinstance(self.retention_months, bool)
-            or not isinstance(self.retention_months, int)
-            or self.retention_months <= 0
-        ):
-            raise ValueError("task_store.retention_months must be a positive integer")
-        for name in ("state_key", "lock_key"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value.strip("/"):
-                raise ValueError(f"task_store.{name} must be a non-empty object key")
-        if self.state_key.lstrip("/") == self.lock_key.lstrip("/"):
-            raise ValueError("task_store.state_key and lock_key must be different")
+            raise ValueError("heartbeat_timeout_sec должен быть больше heartbeat_interval_sec")
+        if self.progress_timeout_sec <= self.progress_update_interval_sec:
+            raise ValueError("progress_timeout_sec должен быть больше progress_update_interval_sec")
+        if not isinstance(self.state_key, str) or not self.state_key.strip("/"):
+            raise ValueError("task_store.state_key: ожидается непустой ключ S3")
+        if self.state_key.startswith("/") or "://" in self.state_key:
+            raise ValueError("task_store.state_key задаётся относительно выходного бакета")
+        if type(self.strip_etag_quotes) is not bool:
+            raise ValueError("strip_etag_quotes: ожидается YAML boolean")
 
 
-@dataclass
+@dataclass(frozen=True)
 class Settings:
     models: list[ModelConfig]
     inference: InferenceConfig
     s3: S3Config
-    task: TaskConfig
     task_store: TaskStoreConfig
 
-    def get_model_config(self, name: str) -> ModelConfig:
-        for m in self.models:
-            if m.name == name:
-                return m
-        available = [m.name for m in self.models]
-        raise KeyError(f"Модель '{name}' не описана в конфиге. Доступные: {available}")
 
-
-def _load_yaml(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-_settings_cache: Settings | None = None
-
-
-def load_settings(config_path: str = "configs/models.yaml") -> Settings:
-    """
-    Синглтон настроек на весь жизненный цикл процесса. В отличие от pydantic-
-    settings BaseSettings, здесь конфиг — простые dataclasses, т.к. основная
-    валидация (обязательность env-переменных) уже делается в _env().
-    """
-    global _settings_cache
-    if _settings_cache is not None:
-        return _settings_cache
-
-    raw = _load_yaml(config_path)
-
-    models = [
-        ModelConfig(
-            name=m["name"],
-            weights_path=str(Path(m["artifacts_dir"]) / m["weights_file"]),
-            schema_path=str(Path(m["artifacts_dir"]) / m["schema_file"]),
-            calibrators_path=str(Path(m["artifacts_dir"]) / m["calibrators_file"]),
-            freq_encoding_path=str(Path(m["artifacts_dir"]) / m["freq_encoding_file"]),
+def load_settings(config_path: str | Path = "configs/models.yaml") -> Settings:
+    """Вызывается один раз в lifespan; ENV не переопределяет поля YAML."""
+    with open(config_path, encoding="utf-8") as source:
+        raw = yaml.safe_load(source)
+    if set(raw) != {"models", "inference", "task_store"}:
+        raise ValueError("YAML должен содержать только models, inference и task_store")
+    models = []
+    for model in raw["models"]:
+        directory = Path(model["artifacts_dir"])
+        models.append(
+            ModelConfig(
+                name=model["name"],
+                weights_path=str(directory / model["weights_file"]),
+                schema_path=str(directory / model["schema_file"]),
+                calibrators_path=str(directory / model["calibrators_file"]),
+                freq_encoding_path=str(directory / model["freq_encoding_file"]),
+                id_cols=model["id_cols"],
+            )
         )
-        for m in raw["models"]
-    ]
-
-    s3_raw = raw["s3"]
-    s3 = S3Config(
-        endpoint_url=_env(s3_raw["endpoint_url_env"]),
-        access_key=_env(s3_raw["access_key_env"]),
-        secret_key=_env(s3_raw["secret_key_env"]),
-        bucket_in=_env(s3_raw["bucket_in_env"]),
-        bucket_out=_env(s3_raw["bucket_out_env"]),
-        region=_env(s3_raw["region_env"], "us-east-1"),
-        use_ssl=_env_bool(s3_raw["use_ssl_env"], True),
-        verify_ssl=_env_bool(s3_raw["verify_ssl_env"], True),
-    )
-
-    task_store_raw = raw.get("task_store", {})
-    defaults = TaskStoreConfig()
-    task_store = TaskStoreConfig(
-        backend=os.environ.get("TASK_STORE_BACKEND", task_store_raw.get("backend", "s3")),
-        state_key=_env("TASK_STORE_STATE_KEY", task_store_raw.get("state_key", defaults.state_key)),
-        lock_key=_env("TASK_STORE_LOCK_KEY", task_store_raw.get("lock_key", defaults.lock_key)),
-        lease_seconds=_env_float(
-            "TASK_STORE_LEASE_SECONDS", task_store_raw.get("lease_seconds", defaults.lease_seconds)
-        ),
-        wait_timeout_sec=_env_float(
-            "TASK_STORE_WAIT_TIMEOUT_SEC", task_store_raw.get("wait_timeout_sec", defaults.wait_timeout_sec)
-        ),
-        poll_interval_sec=_env_float(
-            "TASK_STORE_POLL_INTERVAL_SEC", task_store_raw.get("poll_interval_sec", defaults.poll_interval_sec)
-        ),
-        retention_months=_env_int(
-            "TASK_STORE_RETENTION_MONTHS", task_store_raw.get("retention_months", defaults.retention_months)
-        ),
-        heartbeat_interval_sec=_env_float(
-            "TASK_STORE_HEARTBEAT_INTERVAL_SEC",
-            task_store_raw.get("heartbeat_interval_sec", defaults.heartbeat_interval_sec),
-        ),
-        heartbeat_timeout_sec=_env_float(
-            "TASK_STORE_HEARTBEAT_TIMEOUT_SEC",
-            task_store_raw.get("heartbeat_timeout_sec", defaults.heartbeat_timeout_sec),
-        ),
-        cleanup_interval_sec=_env_float(
-            "TASK_STORE_CLEANUP_INTERVAL_SEC",
-            task_store_raw.get("cleanup_interval_sec", defaults.cleanup_interval_sec),
-        ),
-    )
-
-    _settings_cache = Settings(
+        if (
+            not isinstance(model["id_cols"], list)
+            or not model["id_cols"]
+            or not all(isinstance(col, str) and col for col in model["id_cols"])
+        ):
+            raise ValueError("id_cols должен содержать имена колонок идентификаторов")
+    if not models or len({model.name for model in models}) != len(models):
+        raise ValueError("Список моделей должен быть непустым, имена — уникальными")
+    return Settings(
         models=models,
-        inference=InferenceConfig(**raw.get("inference", {})),
-        s3=s3,
-        task=TaskConfig(**raw.get("task", {})),
-        task_store=task_store,
+        inference=InferenceConfig(**raw["inference"]),
+        task_store=TaskStoreConfig(**raw["task_store"]),
+        s3=S3Config(
+            endpoint_url=required_env("S3_ENDPOINT_URL"),
+            access_key=required_env("S3_ACCESS_KEY"),
+            secret_key=required_env("S3_SECRET_KEY"),
+            bucket_in=required_env("S3_BUCKET_IN"),
+            bucket_out=required_env("S3_BUCKET_OUT"),
+            region=required_env("S3_REGION"),
+            use_ssl=env_bool("S3_USE_SSL"),
+            verify_ssl=env_bool("S3_VERIFY_SSL"),
+        ),
     )
-    return _settings_cache
-
-
-def get_settings() -> Settings:
-    """Удобный алиас для Depends(get_settings) в FastAPI-роутах."""
-    return load_settings()
