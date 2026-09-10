@@ -83,7 +83,7 @@ sequenceDiagram
     participant G as GPU
     K->>P: Запуск контейнера
     P->>P: Получить общий dadm logger
-    P->>P: YAML — настройки сервиса; ENV — подключение S3
+    P->>P: YAML — настройки сервиса. ENV — подключение S3
     P->>Q: GET системного JSON
     alt JSON существует
         Q-->>P: Содержимое + ETag
@@ -195,7 +195,7 @@ sequenceDiagram
     Note over W,Q: Если отмена уже принята — ABORTED, _SUCCESS не публикуется.<br/>Если задача просрочена — FAILED, завершение запрещено.
     W->>S: Сохранить _SUCCESS
     W->>Q: CAS: FINALIZING → DONE
-    Note over W,Q: При временной ошибке S3 повторяется сохранение статуса.<br/>Инференс повторно не запускается; существующий FAILED не заменяется.
+    Note over W,Q: При временной ошибке S3 повторяется сохранение статуса.<br/>Инференс повторно не запускается. Существующий FAILED не заменяется.
     A->>L: GET /tasks/T/status
     L->>API: Прочитать итог
     API->>Q: GET

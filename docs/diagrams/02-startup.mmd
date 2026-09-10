@@ -6,7 +6,7 @@ sequenceDiagram
     participant G as GPU
     K->>P: Запуск контейнера
     P->>P: Получить общий dadm logger
-    P->>P: YAML — настройки сервиса; ENV — подключение S3
+    P->>P: YAML — настройки сервиса. ENV — подключение S3
     P->>Q: GET системного JSON
     alt JSON существует
         Q-->>P: Содержимое + ETag
