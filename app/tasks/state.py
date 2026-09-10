@@ -6,6 +6,8 @@ TaskStorageBackend (см. app/tasks/backends/).
 from __future__ import annotations
 
 import time
+import math
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -18,6 +20,11 @@ class TaskStatus(str, Enum):
     FAILED = "FAILED"
     ABORTING = "ABORTING"
     ABORTED = "ABORTED"
+    FINALIZING = "FINALIZING"
+
+
+ACTIVE_STATUSES = (TaskStatus.RUNNING, TaskStatus.ABORTING, TaskStatus.FINALIZING)
+TERMINAL_STATUSES = (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED)
 
 
 @dataclass
@@ -35,6 +42,9 @@ class TaskState:
     finished_at: float | None = None
     error: str | None = None
     inference_elapsed_sec: float = 0.0
+    owner_id: str | None = None
+    heartbeat_at: float | None = None
+    cancel_requested: bool = False
 
     @property
     def progress_pct(self) -> float:
@@ -57,25 +67,45 @@ class TaskState:
 
 
 class TaskStore:
-    """
-    Фасад над TaskStorageBackend. Публичный API идентичен старой
-    in-memory реализации (v1), кроме get_active(pod_id) и
-    try_add_if_no_active(task), которые теперь работают в разрезе
-    конкретного pod_id (см. докстринг модуля, раздел v3).
+    """Операции над задачами под best-effort lock backend'а: read/modify/write.
 
-    Разделение read/write по договорённости с бизнес-требованиями:
-      - get()/get_active() -> backend.read_state() - без захвата lock,
-        т.к. это read-only операции (в первую очередь GET /status).
-      - add()/update_progress()/set_status() -> backend.mutate() -
-        критическая секция read-modify-write, обязательно под lock'ом
-        backend'а (при S3-backend'е - lease-lock).
+    Чтение не записывает данные и не захватывает S3 lease. Heartbeat timeout
+    означает потерю связи, а не доказанную гибель исполнителя: он влияет только
+    на отбор задач в список активных.
     """
 
-    def __init__(self, backend: TaskStorageBackend) -> None:
+    def __init__(
+        self,
+        backend: TaskStorageBackend,
+        heartbeat_interval_sec: float = 30.0,
+        heartbeat_timeout_sec: float = 180.0,
+    ) -> None:
+        if not math.isfinite(heartbeat_interval_sec) or heartbeat_interval_sec <= 0:
+            raise ValueError("heartbeat_interval_sec must be positive and finite")
+        if not math.isfinite(heartbeat_timeout_sec) or heartbeat_timeout_sec <= heartbeat_interval_sec:
+            raise ValueError("heartbeat_timeout_sec must exceed heartbeat_interval_sec")
         self._backend = backend
+        self.heartbeat_interval_sec = heartbeat_interval_sec
+        self.heartbeat_timeout_sec = heartbeat_timeout_sec
+        self.owner_id = uuid.uuid4().hex
+
+    def _claim(self, task: TaskState) -> None:
+        task.owner_id = self.owner_id
+        task.heartbeat_at = time.time()
+
+    def _check_owner(self, task: TaskState) -> None:
+        if task.owner_id != self.owner_id:
+            raise PermissionError(f"This process does not own task {task.task_id}")
+
+    def executor_alive(self, task: TaskState) -> bool:
+        last_seen = task.heartbeat_at if task.heartbeat_at is not None else task.updated_at
+        return task.status in ACTIVE_STATUSES and time.time() - last_seen < self.heartbeat_timeout_sec
 
     def add(self, task: TaskState) -> None:
-        def _add(state: dict[str, TaskState]) -> dict[str, TaskState]:
+        def _add(state):
+            if task.task_id in state:
+                raise ValueError(f"Task {task.task_id} already exists")
+            self._claim(task)
             state[task.task_id] = task
             return state
 
@@ -85,76 +115,120 @@ class TaskStore:
         return self._backend.read_state().get(task_id)
 
     def get_active(self, pod_id: str | None = None) -> TaskState | None:
-        """
-        Возвращает активную (RUNNING/ABORTING) задачу.
-
-        pod_id=None  - возвращает ЛЮБУЮ активную задачу в системе
-                        (по любому поду) - полезно для общей диагностики.
-        pod_id=<str> - возвращает активную задачу ТОЛЬКО на этом поде,
-                        если она есть (используется в основном сценарии
-                        "не более одной активной задачи на под").
-        """
-        for task in self._backend.read_state().values():
-            if task.status not in (TaskStatus.RUNNING, TaskStatus.ABORTING):
-                continue
-            if pod_id is None or task.pod_id == pod_id:
-                return task
-        return None
+        return next((task for task in self.get_all_active() if pod_id is None or task.pod_id == pod_id), None)
 
     def get_all_active(self) -> list[TaskState]:
-        """Все активные задачи по всем подам (для наблюдаемости/диагностики)."""
-        return [
-            task
-            for task in self._backend.read_state().values()
-            if task.status in (TaskStatus.RUNNING, TaskStatus.ABORTING)
-        ]
+        return [task for task in self._backend.read_state().values() if self.executor_alive(task)]
+
+    def heartbeat(self, task_id: str) -> None:
+        def _heartbeat(state):
+            task = state[task_id]
+            self._check_owner(task)
+            if task.status in ACTIVE_STATUSES:
+                task.heartbeat_at = time.time()
+            return state
+
+        self._backend.mutate(_heartbeat)
 
     def update_progress(self, task_id: str, processed_rows: int, inference_elapsed_sec: float) -> None:
-        def _update(state: dict[str, TaskState]) -> dict[str, TaskState]:
+        def _update(state):
             task = state[task_id]
+            self._check_owner(task)
+            if task.status in ACTIVE_STATUSES:
+                task.processed_rows = processed_rows
+                task.inference_elapsed_sec = inference_elapsed_sec
+                task.updated_at = time.time()
+                task.heartbeat_at = task.updated_at
+            return state
+
+        self._backend.mutate(_update)
+
+    @staticmethod
+    def _set_terminal(task: TaskState, status: TaskStatus, error: str | None = None) -> None:
+        task.status = status
+        task.updated_at = time.time()
+        task.finished_at = task.updated_at
+        task.cancel_requested = False
+        task.error = error
+
+    def set_status(self, task_id: str, status: TaskStatus, error: str | None = None) -> None:
+        def _update(state):
+            task = state[task_id]
+            self._check_owner(task)
+            if task.status in TERMINAL_STATUSES:
+                return state
+            if status in TERMINAL_STATUSES:
+                if status == TaskStatus.DONE and task.status != TaskStatus.FINALIZING:
+                    raise ValueError("Completion must be prepared before marking a task DONE")
+                self._set_terminal(task, status, error)
+            else:
+                raise ValueError("Use request_abort or prepare_completion for nonterminal transitions")
+            return state
+
+        self._backend.mutate(_update)
+
+    def request_abort(self, task_id: str) -> TaskState | None:
+        def _abort(state):
+            task = state.get(task_id)
+            if task is not None and task.status in (TaskStatus.RUNNING, TaskStatus.ABORTING):
+                task.cancel_requested = True
+                task.status = TaskStatus.ABORTING
+                # Запрос к API не подтверждает, что исполнитель ещё жив.
+                # Поэтому updated_at и heartbeat_at здесь не обновляем.
+            return state
+
+        return self._backend.mutate(_abort).get(task_id)
+
+    def cancellation_requested(self, task_id: str) -> bool:
+        task = self.get(task_id)
+        if task is None:
+            raise RuntimeError(f"Task {task_id} disappeared from shared storage")
+        self._check_owner(task)
+        return task.cancel_requested or task.status == TaskStatus.ABORTING
+
+    def prepare_completion(self, task_id: str, processed_rows: int, inference_elapsed_sec: float) -> bool:
+        def _prepare(state):
+            task = state[task_id]
+            self._check_owner(task)
+            if task.status in TERMINAL_STATUSES:
+                return state
             task.processed_rows = processed_rows
             task.inference_elapsed_sec = inference_elapsed_sec
             task.updated_at = time.time()
+            task.heartbeat_at = task.updated_at
+            if task.cancel_requested or task.status == TaskStatus.ABORTING:
+                self._set_terminal(task, TaskStatus.ABORTED)
+            else:
+                # После фиксации этого решения принимать abort уже поздно.
+                task.status = TaskStatus.FINALIZING
             return state
 
-        self._backend.mutate(_update)
-
-    def set_status(self, task_id: str, status: TaskStatus, error: str | None = None) -> None:
-        def _update(state: dict[str, TaskState]) -> dict[str, TaskState]:
-            task = state[task_id]
-            task.status = status
-            task.updated_at = time.time()
-            if status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED):
-                task.finished_at = time.time()
-            if error is not None:
-                task.error = error
-            return state
-
-        self._backend.mutate(_update)
+        task = self._backend.mutate(_prepare)[task_id]
+        return task.status == TaskStatus.FINALIZING
 
     def try_add_if_no_active(self, task: TaskState) -> TaskState | None:
-        """
-        Атомарно (в рамках ОДНОГО backend.mutate()-вызова, т.е. под общим
-        межподовым lock'ом): если на поде task.pod_id уже есть активная
-        задача - возвращает её без изменений; иначе добавляет task и
-        возвращает None.
+        blocked_task_id = None
 
-        Проверка активности выполняется СТРОГО в разрезе pod_id: задача
-        на другом поде не мешает взять новую задачу на текущем - правило
-        "1 активная задача на 1 под", а не "1 активная задача на весь
-        сервис".
-        """
-        result: dict[str, TaskState | None] = {"active": None}
-
-        def _try_add(state: dict[str, TaskState]) -> dict[str, TaskState]:
+        def _add(state):
+            nonlocal blocked_task_id
             for existing in state.values():
-                if existing.pod_id != task.pod_id:
+                if existing.pod_id != task.pod_id or existing.status not in ACTIVE_STATUSES:
                     continue
-                if existing.status in (TaskStatus.RUNNING, TaskStatus.ABORTING):
-                    result["active"] = existing
+                # TaskManager отдельно удерживает слот работающего локального
+                # worker, независимо от heartbeat и неудачных запросов запуска.
+                if self.executor_alive(existing):
+                    blocked_task_id = existing.task_id
                     return state
+            if task.task_id in state:
+                raise ValueError(f"Task {task.task_id} already exists")
+            self._claim(task)
             state[task.task_id] = task
             return state
 
-        self._backend.mutate(_try_add)
-        return result["active"]
+        state = self._backend.mutate(_add)
+        if task.task_id in state:
+            return None
+        return state[blocked_task_id]
+
+    def cleanup(self) -> None:
+        self._backend.cleanup()

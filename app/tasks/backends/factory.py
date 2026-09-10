@@ -32,6 +32,13 @@ def create_task_storage_backend(
                 **client_kwargs,
             },
             use_ssl=s3_config.use_ssl,
+            # Ограничиваем сетевые ожидания для коротких операций task tracker.
+            # Lease остаётся best-effort: таймаут транспорта не является fencing.
+            config_kwargs={
+                "connect_timeout": 5,
+                "read_timeout": 10,
+                "retries": {"mode": "standard", "total_max_attempts": 2},
+            },
             skip_instance_cache=True,
             use_listings_cache=False,
         )

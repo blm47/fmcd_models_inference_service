@@ -12,7 +12,6 @@ lifespan выполняет всю "тяжёлую" инициализацию �
 """
 
 from contextlib import asynccontextmanager
-import logging
 import os
 import socket
 
@@ -27,7 +26,8 @@ from app.models.loader import load_all_models
 from app.storage.s3_client import S3Client
 from app.tasks.cancellation import CancellationRegistry
 from app.tasks.manager import TaskManager
-from app.tasks.state import TaskStore, TaskStatus
+from app.tasks.maintenance import TaskMaintenance
+from app.tasks.state import TaskStore
 
 
 @asynccontextmanager
@@ -41,12 +41,17 @@ async def lifespan(app: FastAPI):
         models = load_all_models(settings.models, settings.inference, logger)
 
         task_storage_backend = create_task_storage_backend(settings.task_store, settings.s3)
+        task_storage_backend.initialize()
 
-        pod_id = os.environ.get("HOSTNAME", socket.gethostname())
+        pod_id = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME", socket.gethostname())
 
         app.state.settings = settings
         app.state.models = models
-        app.state.task_store = TaskStore(task_storage_backend)
+        app.state.task_store = TaskStore(
+            task_storage_backend,
+            heartbeat_interval_sec=settings.task_store.heartbeat_interval_sec,
+            heartbeat_timeout_sec=settings.task_store.heartbeat_timeout_sec,
+        )
         app.state.cancellation_registry = CancellationRegistry()
         app.state.task_manager = TaskManager(
             app.state.task_store, app.state.cancellation_registry, pod_id=pod_id
@@ -54,22 +59,21 @@ async def lifespan(app: FastAPI):
         app.state.s3_client = S3Client(settings.s3)
         app.state.pod_id = pod_id
 
-        # Убиваем повисшие таски в случае рестарта ПОДа
-        active_tasks = app.state.task_store.get_all_active()
-        local_active_task = [task.task_id for task in active_tasks if task.pod_id == pod_id]
-        for bad_task_id in local_active_task:
-            logger.warn(f"Found active task {bad_task_id} on pod {pod_id}, aborting it")
-            app.state.task_store.set_status(bad_task_id, TaskStatus.FAILED)
+        # Другой процесс не должен помечать старого исполнителя как FAILED только
+        # по имени пода. API исключает его из активных после истечения heartbeat.
+        maintenance = TaskMaintenance(app.state.task_store, settings.task_store.cleanup_interval_sec)
+        maintenance.start()
 
         logger.info(f"Сервис запущен на поде pod_id={pod_id}")
 
-    except Exception as exc:
-        import traceback
-        msg = f"lifespan error: {traceback.format_exc()}"
-        print(msg, flush=True)
-        logger.error(msg)
+    except Exception:
+        logger.exception("Service initialization failed")
+        raise
 
-    yield
+    try:
+        yield
+    finally:
+        maintenance.stop()
     # На shutdown специально ничего не чистим: если под убивают во время
     # активной задачи, это внештатная ситуация уровня K8s (readiness/liveness),
     # а не штатный сценарий graceful shutdown в v1.
@@ -88,11 +92,11 @@ def health():
 
 @app.get('/healthz/readiness')
 async def route_readiness_probe():
-    """ readiness probe """
+    """Проверка готовности сервиса (readiness probe)."""
     return {'details': 'OK'}
 
 
 @app.get('/healthz/liveness')
 async def route_liveness_probe():
-    """ liveness probe """
+    """Проверка доступности сервиса (liveness probe)."""
     return {'details': 'OK'}

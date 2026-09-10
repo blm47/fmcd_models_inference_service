@@ -33,6 +33,11 @@ class CancellationRegistry:
             event = self._events.get(task_id)
         return event.is_set() if event else False
 
+    def task_ids(self) -> list[str]:
+        """Зарезервированные локальные исполнители, включая ожидающие запуска."""
+        with self._lock:
+            return list(self._events)
+
     def cleanup(self, task_id: str) -> None:
         with self._lock:
             self._events.pop(task_id, None)

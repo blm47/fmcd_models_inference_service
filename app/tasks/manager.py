@@ -43,16 +43,23 @@ class TaskManager:
         self, model_name: str, s3_input_path: str, s3_output_path: str, total_rows: int
     ) -> TaskState:
         """
-        Атомарно (межподово, через backend.mutate(), в разрезе pod_id):
+        Под локальным lock и best-effort lease backend'а, в разрезе pod_id:
         если на ТЕКУЩЕМ поде есть активная задача -> кидает
         TaskAlreadyRunningError с её состоянием (409-ответ с task_id,
         статусом и ETA той задачи, что занимает именно этот под). Если
         активна задача только на ДРУГОМ поде - берёт новую задачу на
         текущем поде без проблем. threading.Lock здесь защищает только от
         гонки внутри одного процесса (два почти одновременных HTTP-запроса
-        на один под); межподовая гонка закрывается backend.mutate().
+        на один под). Backend уменьшает риск межподовой гонки без CAS.
         """
         with self._start_lock:
+            # Heartbeat timeout не должен разрешать запуск второго локального GPU worker.
+            # Регистрация сохраняется до worker.finally, даже после статуса DONE.
+            for local_task_id in self._cancellation.task_ids():
+                active = self._store.get(local_task_id)
+                if active is None:
+                    raise RuntimeError("Local worker is still registered but its status is missing")
+                raise TaskAlreadyRunningError(active)
             task_id = str(uuid.uuid4())
             task = TaskState(
                 task_id=task_id,
@@ -73,9 +80,7 @@ class TaskManager:
         return self._store.get(task_id)
 
     def request_abort(self, task_id: str) -> TaskState | None:
-        task = self._store.get(task_id)
-        if task is None or task.status not in (TaskStatus.RUNNING,):
-            return task
-        self._cancellation.request_cancel(task_id)
-        self._store.set_status(task_id, TaskStatus.ABORTING)
-        return self._store.get(task_id)
+        task = self._store.request_abort(task_id)
+        if task is not None and task.status == TaskStatus.ABORTING:
+            self._cancellation.request_cancel(task_id)
+        return task
