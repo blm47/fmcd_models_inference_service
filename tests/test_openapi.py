@@ -7,6 +7,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from app.main import app
+from scripts.export_openapi import render_markdown
 
 
 class OpenApiTests(unittest.TestCase):
@@ -14,6 +15,8 @@ class OpenApiTests(unittest.TestCase):
         exported_path = Path(__file__).resolve().parents[1] / "docs" / "openapi.yaml"
         exported = yaml.safe_load(exported_path.read_text(encoding="utf-8"))
         self.assertEqual(exported, app.openapi())
+        markdown_path = exported_path.with_name("api.md")
+        self.assertEqual(markdown_path.read_text(encoding="utf-8"), render_markdown(app.openapi()))
 
     def test_documentation_endpoints(self):
         client = TestClient(app)
