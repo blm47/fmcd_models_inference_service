@@ -1,4 +1,5 @@
-"""Фоновый инференс с отменой через S3 и отдельным heartbeat.
+"""
+Фоновый инференс с отменой через S3 и отдельным heartbeat.
 
 Отмена кооперативная: уже начатый чанк инференса завершается, после чего
 его результат не записывается, если поступила отмена. Перед записью _SUCCESS
@@ -191,7 +192,9 @@ def run_task(
 
 
 def consume_queue(store, models, settings, s3_client, pod_id, stop, logger) -> None:
-    """Один поток последовательно выполняет задачи; занятый GPU не блокирует API."""
+    """
+    Один поток последовательно выполняет задачи; занятый GPU не блокирует API.
+    """
     current_task = None
     while not stop.is_set():
         try:
@@ -225,7 +228,9 @@ def consume_queue(store, models, settings, s3_client, pod_id, stop, logger) -> N
 
 
 def monitor_queue(store, stop, logger) -> None:
-    """Проверяет таймауты независимо от занятости GPU на этом поде."""
+    """
+    Проверяет таймауты независимо от занятости GPU на этом поде.
+    """
     next_cleanup = time.monotonic()
     while not stop.is_set():
         try:

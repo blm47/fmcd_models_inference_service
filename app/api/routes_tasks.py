@@ -10,20 +10,42 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.api.schemas import (
     ActiveTasksResponse,
     ActiveTaskSummary,
+    ErrorResponse,
     TaskAbortResponse,
     TaskStatusResponse,
 )
 from app.deps import get_task_store
 from app.tasks.state import TaskStore
 
-router = APIRouter(prefix="/tasks", tags=["tasks"])
+router = APIRouter(
+    prefix="/tasks",
+    tags=["tasks"],
+    responses={
+        503: {"model": ErrorResponse, "description": "Не удалось прочитать или обновить очередь S3"}
+    },
+)
 
 
-@router.get("/{task_id}/status", response_model=TaskStatusResponse)
+@router.get(
+    "/{task_id}/status",
+    response_model=TaskStatusResponse,
+    summary="Получить статус и прогресс расчёта",
+    responses={
+        404: {"model": ErrorResponse, "description": "Задача не найдена или удалена из истории"}
+    },
+)
 def get_task_status(
     task_id: str,
     task_store: TaskStore = Depends(get_task_store),
 ):
+    """
+    Читает общую очередь, поэтому запрос можно направить на любой под.
+
+    Airflow опрашивает этот метод до DONE, FAILED или ABORTED.
+    Результат готов к чтению только при DONE. ETA является оценкой, а не дедлайном.
+    `executor_alive` вычисляется по heartbeat и не подтверждает физическую
+    остановку процесса при значении false.
+    """
     task = task_store.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Задача {task_id} не найдена")
@@ -47,8 +69,23 @@ def get_task_status(
     )
 
 
-@router.post("/{task_id}/abort", response_model=TaskAbortResponse)
+@router.post(
+    "/{task_id}/abort",
+    response_model=TaskAbortResponse,
+    summary="Запросить отмену расчёта",
+    responses={
+        404: {"model": ErrorResponse, "description": "Задача не найдена"},
+        409: {"model": ErrorResponse, "description": "Задача FINALIZING уже публикует результат"},
+    },
+)
 def abort_task(task_id: str, task_store: TaskStore = Depends(get_task_store)):
+    """
+    QUEUED отменяется сразу, RUNNING переходит в ABORTING.
+
+    Worker завершает текущую операцию и подтверждает ABORTED при проверке отмены.
+    Ответ ABORTING ещё не означает остановку. Для завершённой задачи возвращается
+    её текущий статус. Этот метод не удаляет выходные файлы и не запускает повтор.
+    """
     task = task_store.request_abort(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Задача {task_id} не найдена")
@@ -56,9 +93,13 @@ def abort_task(task_id: str, task_store: TaskStore = Depends(get_task_store)):
     return TaskAbortResponse(task_id=task.task_id, status=task.status)
 
 
-@router.get("/active", response_model=ActiveTasksResponse)
+@router.get(
+    "/active", response_model=ActiveTasksResponse, summary="Получить все незавершённые задачи"
+)
 def get_active_tasks(task_store: TaskStore = Depends(get_task_store)):
-    """Все незавершённые задачи, включая очередь и потерявших heartbeat исполнителей."""
+    """
+    Все незавершённые задачи, включая очередь и потерявших heartbeat исполнителей.
+    """
     active_tasks = task_store.get_all_active()
     return ActiveTasksResponse(
         active_tasks=[

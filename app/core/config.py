@@ -1,4 +1,6 @@
-"""Настройки S3 читаются из ENV, настройки сервиса — только из YAML."""
+"""
+Настройки S3 читаются из ENV, настройки сервиса — только из YAML.
+"""
 
 import math
 import os
@@ -105,11 +107,15 @@ class Settings:
 
 
 def load_settings(config_path: str | Path = "configs/models.yaml") -> Settings:
-    """Вызывается один раз в lifespan; ENV не переопределяет поля YAML."""
+    """
+    Вызывается один раз в lifespan; ENV не переопределяет поля YAML.
+    """
     with open(config_path, encoding="utf-8") as source:
         raw = yaml.safe_load(source)
+
     if set(raw) != {"models", "inference", "task_store"}:
         raise ValueError("YAML должен содержать только models, inference и task_store")
+    
     models = []
     for model in raw["models"]:
         directory = Path(model["artifacts_dir"])
@@ -129,8 +135,10 @@ def load_settings(config_path: str | Path = "configs/models.yaml") -> Settings:
             or not all(isinstance(col, str) and col for col in model["id_cols"])
         ):
             raise ValueError("id_cols должен содержать имена колонок идентификаторов")
+        
     if not models or len({model.name for model in models}) != len(models):
         raise ValueError("Список моделей должен быть непустым, имена — уникальными")
+    
     return Settings(
         models=models,
         inference=InferenceConfig(**raw["inference"]),

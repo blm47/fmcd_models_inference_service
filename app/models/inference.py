@@ -4,10 +4,6 @@
 
   pandas_chunk_to_fmcd_batch -> model(fmcd_batch) -> sigmoid(d_logits) ->
   Platt калибрация (log_reg + logit) -> expm1-денормализация F/M/C/count.
-
-Отличие от ноутбука: здесь функция работает над ОДНИМ чанком (для потоковой
-S3-записи), а разбиение чанка на INFER_BATCH_SIZE под-батчи для forward-pass
-остаётся внутренним делом этой функции.
 """
 
 from collections.abc import Callable

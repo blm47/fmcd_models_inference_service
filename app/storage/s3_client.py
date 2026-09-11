@@ -1,4 +1,6 @@
-"""Потоковое чтение parquet из S3 и запись частей результата с маркером _SUCCESS."""
+"""
+Потоковое чтение parquet из S3 и запись частей результата с маркером _SUCCESS.
+"""
 
 import warnings
 from dataclasses import dataclass, field
@@ -23,7 +25,9 @@ class ParquetPrefixWriter:
     _part_idx: int = field(default=0, init=False)
 
     def write_chunk(self, df_chunk: pd.DataFrame) -> None:
-        """Пишет один чанк как отдельный парт-файл под output_prefix."""
+        """
+        Пишет один чанк как отдельный парт-файл под output_prefix.
+        """
         table = pa.Table.from_pandas(df_chunk, preserve_index=False)
         part_path = f"{self.output_prefix}/part-{self._part_idx:05d}.parquet"
         with self.fs.open(part_path, "wb") as sink:
@@ -31,7 +35,9 @@ class ParquetPrefixWriter:
         self._part_idx += 1
 
     def close(self) -> None:
-        """Кладёт пустой _SUCCESS маркер - признак полностью завершённой записи."""
+        """
+        Кладёт пустой _SUCCESS маркер - признак полностью завершённой записи.
+        """
         success_path = f"{self.output_prefix}/{_SUCCESS_MARKER}"
         with self.fs.open(success_path, "wb") as sink:
             sink.write(b"")
@@ -76,7 +82,9 @@ class S3Client:
         return ds.dataset(prefix, filesystem=fs, format="parquet")
 
     def count_rows(self, s3_prefix: str) -> int:
-        """Дешёвый подсчёт строк по метаданным всех парт-файлов, без чтения данных."""
+        """
+        Дешёвый подсчёт строк по метаданным всех парт-файлов, без чтения данных.
+        """
         dataset = self.open_dataset(s3_prefix)
         return dataset.count_rows()
 

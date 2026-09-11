@@ -1,4 +1,6 @@
-"""Общая очередь в одном объекте S3. Все изменения выполняются через CAS."""
+"""
+Общая очередь в одном объекте S3. Все изменения выполняются через CAS.
+"""
 
 from __future__ import annotations
 
@@ -79,7 +81,9 @@ def prefixes_overlap(left: str, right: str) -> bool:
 
 
 class TaskStore:
-    """Читает очередь, принимает заявки и назначает исполнителей без lock-файла."""
+    """
+    Читает очередь, принимает заявки и назначает исполнителей.
+    """
 
     def __init__(self, client, bucket: str, config: TaskStoreConfig, logger: Any):
         self.client = client
@@ -125,7 +129,9 @@ class TaskStore:
         return tasks, etag, revision
 
     def initialize(self) -> None:
-        """Создаёт объект только при отсутствии; одновременный старт подов допустим."""
+        """
+        Создаёт объект только при отсутствии; одновременный старт подов допустим.
+        """
         deadline = time.monotonic() + self.config.cas_timeout_sec
         while True:
             try:
@@ -161,7 +167,9 @@ class TaskStore:
         time.sleep(min(remaining, random.uniform(0.5, 1.5) * self.config.cas_retry_interval_sec))
 
     def _mutate(self, change: Callable[[dict[str, TaskState]], T]) -> T:
-        """Повторяет чистое идемпотентное изменение после конфликта или потери ответа PUT."""
+        """
+        Повторяет чистое идемпотентное изменение после конфликта или потери ответа PUT.
+        """
         deadline = time.monotonic() + self.config.cas_timeout_sec
         while True:
             try:
@@ -392,7 +400,9 @@ class TaskStore:
         return True
 
     def fail_stale(self) -> None:
-        """Атомарно завершает просроченные расчёты, не затрагивая очередь и финальные статусы."""
+        """
+        Атомарно завершает просроченные расчёты, не затрагивая очередь и финальные статусы.
+        """
 
         def expire(tasks):
             return [task.task_id for task in tasks.values() if self._expire_task(task)]

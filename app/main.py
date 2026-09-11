@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes_infer import router as infer_router
 from app.api.routes_tasks import router as tasks_router
+from app.api.schemas import HealthResponse
 from app.core.config import load_settings
 from app.core.logging import setup_logging
 from app.core.shutdown import install_shutdown_handlers, restore_shutdown_handlers
@@ -104,7 +105,29 @@ async def lifespan(app: FastAPI):
         logger.info(f"Сервис остановлен на поде {pod_id}")
 
 
-app = FastAPI(title="FMCD Inference Service", lifespan=lifespan)
+app = FastAPI(
+    title="FMCD Inference Service",
+    description=(
+        "Асинхронный GPU-инференс над parquet в S3. Любой под принимает заявки, "
+        "свободный worker забирает их из общей очереди S3.\n\n"
+        "**Airflow:** подготовить вход → `POST /infer` → опрашивать "
+        "`GET /tasks/{task_id}/status` → при `DONE` забрать результат в Hadoop.\n\n"
+        "**Статусы:** `QUEUED → RUNNING → FINALIZING → DONE`. "
+        "Ошибка или таймаут переводит задачу в `FAILED`. "
+        "Отмена: `QUEUED → ABORTED` или `RUNNING → ABORTING → ABORTED`.\n\n"
+        "Повтор HTTP-запроса использует прежний ключ идемпотентности. "
+        "Новая попытка расчёта требует нового ключа и очищенного выходного префикса. "
+        "Не удаляйте системный файл очереди. `FAILED` по таймауту не подтверждает "
+        "остановку старого PUT: повтор в тот же физический путь не имеет строгой изоляции."
+    ),
+    openapi_tags=[
+        {"name": "inference", "description": "Постановка расчёта в общую очередь."},
+        {"name": "tasks", "description": "Статусы, прогресс и отмена задач на всех подах."},
+        {"name": "health", "description": "Проверки готовности процесса для Kubernetes."},
+    ],
+    swagger_ui_parameters={"defaultModelsExpandDepth": 0, "displayRequestDuration": True},
+    lifespan=lifespan,
+)
 app.include_router(infer_router)
 app.include_router(tasks_router)
 
@@ -132,10 +155,29 @@ for error_type in (ClientError, BotoCoreError, TimeoutError):
     app.add_exception_handler(error_type, storage_unavailable)
 
 
-@app.get("/health")
-@app.get("/healthz/readiness")
-@app.get("/healthz/liveness")
+@app.get(
+    "/health",
+    tags=["health"],
+    response_model=HealthResponse,
+    responses={503: {"model": HealthResponse, "description": "unavailable"}},
+    summary="Проверить состояние сервиса",
+)
+@app.get(
+    "/healthz/readiness",
+    tags=["health"],
+    response_model=HealthResponse,
+    responses={503: {"model": HealthResponse, "description": "unavailable"}},
+    summary="Проверить готовность пода",
+)
+@app.get(
+    "/healthz/liveness",
+    tags=["health"],
+    response_model=HealthResponse,
+    responses={503: {"model": HealthResponse, "description": "unavailable"}},
+    summary="Проверить работу потоков пода",
+)
 def health(request: Request):
+    """200 при работающих consumer и monitor, иначе 503. Доступ к S3 не проверяет."""
     consumer = getattr(request.app.state, "consumer", None)
     monitor = getattr(request.app.state, "monitor", None)
     stop = getattr(request.app.state, "stop", None)

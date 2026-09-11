@@ -14,7 +14,9 @@ from fmcd.data.production import ProdSchema
 
 @dataclass
 class ModelBundle:
-    """Всё, что нужно для инференса ОДНОЙ модели: веса + препроцессинг-артефакты."""
+    """
+    Всё, что нужно для инференса ОДНОЙ модели: веса + препроцессинг-артефакты.
+    """
 
     name: str
     model: Any  # torch.nn.Module (FMCDModel), тип из fmcd.model.fmcd_model

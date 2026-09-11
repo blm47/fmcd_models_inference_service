@@ -7,11 +7,6 @@
   - model.cat_processor.set_frequency_encoding(...) из freq_counts
   - ProdSchema.from_json_local(schema.json)
   - calibrators.json -> calibs_dict
-
-Вызывается для каждой модели из config/models.yaml -> models[] один раз
-в lifespan (app/main.py): на старте пода - веса лежат в образе, артефакты
-лежат в artifacts/<model_name>/, поэтому холодный старт пода - это и есть
-точка загрузки, без ленивой подгрузки по запросу.
 """
 
 import json
@@ -79,5 +74,7 @@ def load_model_bundle(
 def load_all_models(
     model_cfgs: list[ModelConfig], inference_cfg: InferenceConfig, logger: Any
 ) -> dict[str, ModelBundle]:
-    """Загружает все модели из конфига в dict[name -> ModelBundle] для app.state.models."""
+    """
+    Загружает все модели из конфига в dict[name -> ModelBundle] для app.state.models.
+    """
     return {cfg.name: load_model_bundle(cfg, inference_cfg, logger) for cfg in model_cfgs}
