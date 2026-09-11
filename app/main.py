@@ -8,6 +8,7 @@ import traceback
 from contextlib import asynccontextmanager
 
 import boto3
+import urllib3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Request
@@ -35,6 +36,10 @@ async def lifespan(app: FastAPI):
         settings = load_settings()
         s3 = settings.s3
         queue = settings.task_store
+        if not s3.verify_ssl:
+            # Убираем повторяющиеся предупреждения urllib3 при опросе очереди S3.
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            logger.warn("Проверка TLS-сертификата S3 отключена: S3_VERIFY_SSL=false")
         client = boto3.client(
             "s3",
             endpoint_url=s3.endpoint_url,
