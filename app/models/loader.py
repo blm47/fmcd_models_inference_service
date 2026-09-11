@@ -7,33 +7,26 @@
   - model.cat_processor.set_frequency_encoding(...) из freq_counts
   - ProdSchema.from_json_local(schema.json)
   - calibrators.json -> calibs_dict
-
-Вызывается для каждой модели из config/models.yaml -> models[] один раз
-в lifespan (app/main.py): на старте пода - веса лежат в образе, артефакты
-лежат в artifacts/<model_name>/, поэтому холодный старт пода - это и есть
-точка загрузки, без ленивой подгрузки по запросу.
 """
 
-import logging
 import json
+from typing import Any
 
-import numpy as np
 import torch
 import torch.serialization
-
 from fmcd.data.production import ProdSchema, load_freq_counts_local
 from fmcd.model.fmcd_model import FMCDModel
 
-from app.core.config import ModelConfig, InferenceConfig
+from app.core.config import InferenceConfig, ModelConfig
 from app.models.registry import ModelBundle
 
-# logger = logging.getLogger(__name__)
 
-
-def load_model_bundle(model_cfg: ModelConfig, inference_cfg: InferenceConfig, logger: logging.Logger) -> ModelBundle:
-    device = torch.device(inference_cfg.device if torch.cuda.is_available() else "cpu")
-    if inference_cfg.device == "cuda" and device.type != "cuda":
-        logger.warn("CUDA запрошена в конфиге, но недоступна - падаем на CPU")
+def load_model_bundle(
+    model_cfg: ModelConfig, inference_cfg: InferenceConfig, logger: Any
+) -> ModelBundle:
+    device = torch.device(inference_cfg.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA задана в YAML, но недоступна на поде")
 
     schema = ProdSchema.from_json_local(model_cfg.schema_path)
 
@@ -53,23 +46,14 @@ def load_model_bundle(model_cfg: ModelConfig, inference_cfg: InferenceConfig, lo
     for i, counts in enumerate(freq_counts):
         model.cat_processor.set_frequency_encoding(i, torch.from_numpy(counts))
 
-    with open(model_cfg.calibrators_path, "r", encoding="utf-8") as f:
+    with open(model_cfg.calibrators_path, encoding="utf-8") as f:
         calibrators = json.loads(f.read())
 
     id_cols = model_cfg.id_cols
 
-    calib_intercepts = np.array(
-        [calibrators[col]["intercept"] for col in d_cols],
-        dtype=np.float64,
-    )  # shape (n_d_cols,)
-    calib_coefs = np.array(
-        [calibrators[col]["coef"] for col in d_cols],
-        dtype=np.float64,
-    )  # shape (n_d_cols,)
-
     logger.info(
         f"Модель '{model_cfg.name}' загружена: device={device}, MCG={schema.num_mcg}, "
-        f"num_features={schema.num_numerical}, cat_features={schema.num_categorical}",
+        f"num_features={schema.num_numerical}, cat_features={schema.num_categorical}"
     )
     return ModelBundle(
         name=model_cfg.name,
@@ -84,15 +68,13 @@ def load_model_bundle(model_cfg: ModelConfig, inference_cfg: InferenceConfig, lo
         f_cols=f_cols,
         m_cols=m_cols,
         c_cols=c_cols,
-        calib_intercepts=calib_intercepts,
-        calib_coefs=calib_coefs,
     )
 
 
 def load_all_models(
-        model_cfgs: list[ModelConfig],
-        inference_cfg: InferenceConfig,
-        logger: logging.Logger
+    model_cfgs: list[ModelConfig], inference_cfg: InferenceConfig, logger: Any
 ) -> dict[str, ModelBundle]:
-    """Загружает все модели из конфига в dict[name -> ModelBundle] для app.state.models."""
+    """
+    Загружает все модели из конфига в dict[name -> ModelBundle] для app.state.models.
+    """
     return {cfg.name: load_model_bundle(cfg, inference_cfg, logger) for cfg in model_cfgs}

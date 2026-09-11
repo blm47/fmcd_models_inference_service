@@ -4,6 +4,7 @@ image:
   pullPolicy: IfNotPresent
 
 replicaCount: 1
+terminationGracePeriodSeconds: 120
 
 resources:
   limits:
@@ -20,38 +21,6 @@ nodeSelector:
 
 service:
   port: 8000
-
-# Список моделей сервиса - при масштабировании до 7 моделей просто
-# дописываются новые элементы, шаблон configmap.yaml сам их разложит
-# в configs/models.yaml -> models[].
-models:
-  - name: "cc"
-    artifactsDir: "artifacts/cc"
-    weightsFile: "model.pth"
-    schemaFile: "schema.json"
-    calibratorsFile: "calibrators.json"
-    freqEncodingFile: "freq_encoding.parquet"
-
-inference:
-  device: "cuda"
-  inferBatchSize: 16
-  chunkSize: 100000
-
-task:
-  progressUpdateIntervalSec: 10
-
-# Два постоянных S3-объекта для всех подов, без DELETE.
-taskStore:
-  backend: "s3"
-  stateKey: "_system/fmcd_models/task_state.json"
-  lockKey: "_system/fmcd_models/task_state.lock"
-  leaseSeconds: 60
-  waitTimeoutSec: 300
-  pollIntervalSec: 1.0
-  retentionMonths: 6
-  heartbeatIntervalSec: 30
-  heartbeatTimeoutSec: 180
-  cleanupIntervalSec: 3600
 
 # Реальные значения S3 передаются через env (см. templates/deployment.yaml):
 # несекретные - напрямую из values, секретные - из existingSecretName.

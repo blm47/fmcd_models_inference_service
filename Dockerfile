@@ -39,18 +39,19 @@ RUN pip install webdataset==0.1.103
 RUN pip install pyarrow==12.0.0
 RUN pip install requests==2.26.0
 RUN pip install aiosqlite==0.17.0
-RUN pip install boto3==1.40.7
+RUN pip install "boto3>=1.35.76"
+RUN pip install "s3fs>=2025.3.0"
+RUN pip install "pyyaml>=6.0"
 RUN pip install pyspark==4.0.1
 RUN pip install jedi==0.18.2
 RUN pip install autopep8==1.6.0
 RUN pip install ipython==7.32.0
 RUN pip install confluent_kafka==2.8.0
 RUN pip install autodynatrace==2.1.1
-RUN pip install s3fs==2024.5.0
 RUN pip install dadm-functions==0.5.5
 RUN pip install psutil==5.9.8
 
 EXPOSE 8080
 
 #CMD export LD_LIBRARY_PATH=/usr/lib/oracle/12.1/client64/lib:$LD_LIBRARY_PATH && . /app/.venv/bin/activate && python3 main.py
-CMD export LD_LIBRARY_PATH=/usr/lib/oracle/12.1/client64/lib:$LD_LIBRARY_PATH && python3 main.py
+CMD export LD_LIBRARY_PATH=/usr/lib/oracle/12.1/client64/lib:$LD_LIBRARY_PATH && exec python3 main.py

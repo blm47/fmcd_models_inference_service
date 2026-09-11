@@ -6,7 +6,6 @@
 import numpy as np
 import pandas as pd
 import torch
-
 from fmcd.data.base import FMCDBatch
 from fmcd.data.production import ProdSchema
 

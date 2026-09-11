@@ -1,9 +1,8 @@
-# Список моделей сервиса. Сейчас один элемент, при масштабировании до 7
-# моделей просто дописываются новые элементы списка - код (loader/registry)
-# не меняется.
+# Единственный источник настроек сервиса. Поля не переопределяются через ENV.
 models:
-  - name: "cc"
-    artifacts_dir: "artifacts/cc"
+  - name: "credit_cards"
+    id_cols: ["customer_mdm_id", "partition_report_dt"]
+    artifacts_dir: "artifacts/credit_cards"
     weights_file: "model.pth"
     schema_file: "schema.json"
     calibrators_file: "calibrators.json"
@@ -12,38 +11,23 @@ models:
 inference:
   device: "cuda"
   infer_batch_size: 500
-  chunk_size: 5_000
+  chunk_size: 5000
 
-# Значения S3 берутся из глобальных переменных окружения (пробрасываются
-# Helm-ом в Deployment env). Здесь указываем не сами значения, а ИМЕНА
-# переменных окружения, откуда их нужно читать.
-s3:
-  endpoint_url_env: "S3_ENDPOINT_URL"
-  access_key_env: "S3_ACCESS_KEY"
-  secret_key_env: "S3_SECRET_KEY"
-  bucket_in_env: "S3_BUCKET_IN"
-  bucket_out_env: "S3_BUCKET_OUT"
-  region_env: "S3_REGION"
-  use_ssl_env: "S3_USE_SSL"
-  verify_ssl_env: "S3_VERIFY_SSL"
-
-task:
-  progress_update_interval_sec: 10
-
-# Task tracker: где физически хранится состояние задач между подами.
-# backend: "s3" (сейчас) | "redis"/"postgres" (заложено на будущее,
-# смена значения не требует изменений в коде TaskManager/TaskStore).
-# state_key/lock_key - относительно bucket_out (см. s3.bucket_out_env).
-# Правило активности задачи - "1 активная задача на 1 под" (не на весь
-# сервис) - позволяет сервису на N подах вести до N параллельных задач.
+# Один объект в S3_BUCKET_OUT. Удаление объектов не используются.
 task_store:
-  backend: "s3"
   state_key: "_system/fmcd_models/task_state.json"
-  lock_key: "_system/fmcd_models/task_state.lock"
-  lease_seconds: 60
-  wait_timeout_sec: 300
-  poll_interval_sec: 1.0
+  cas_timeout_sec: 30
+  cas_retry_interval_sec: 0.2
+  poll_interval_sec: 3
   retention_months: 6
+  max_pending_tasks: 1000
   heartbeat_interval_sec: 30
   heartbeat_timeout_sec: 180
+  # Максимальное время без сохранённого прогресса, даже если heartbeat жив.
+  progress_timeout_sec: 1800
   cleanup_interval_sec: 3600
+  progress_update_interval_sec: 10
+  connect_timeout_sec: 5
+  read_timeout_sec: 10
+  # Особенность используемого S3-сервера, который возвращает ETag в кавычках.
+  strip_etag_quotes: true

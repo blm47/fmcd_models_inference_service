@@ -1,0 +1,32 @@
+sequenceDiagram
+    autonumber
+    participant A as Airflow
+    participant API as API сервиса
+    participant Q as Общая очередь S3
+    participant W as GPU-под
+    participant M as Монитор
+    participant S as S3 — выходные данные
+
+    Note over Q,W: Задача выполняется: RUNNING
+    alt Ошибка расчёта или остановка пода
+        W->>W: Завершить текущую операцию и остановить расчёт
+        W->>Q: FAILED — сохранить причину ошибки
+    else Исполнитель пропал или прогресс остановился
+        M->>Q: Проверить heartbeat и время обновления прогресса
+        M->>Q: При превышении таймаута сохранить FAILED
+    else Запрошена отмена
+        A->>API: POST /tasks/task_id/abort
+        API->>Q: ABORTING — отмена принята
+        W->>Q: Прочитать запрос отмены
+        W->>W: Завершить текущую операцию
+        W->>Q: ABORTED — расчёт остановлен
+    end
+
+    A->>API: Проверить статус
+    API->>Q: Прочитать итог
+    Q-->>API: FAILED или ABORTED и причина
+    API-->>A: Расчёт не завершён успешно
+    A->>S: Очистить выходной префикс этой попытки
+    A->>API: Новый запрос с новым ключом попытки
+    API->>Q: Новая задача — QUEUED
+    Note over A,Q: Новая попытка начинается с начала.<br/>Старая задача сохраняет финальный статус.

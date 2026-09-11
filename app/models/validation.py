@@ -12,9 +12,6 @@ from dataclasses import dataclass
 from app.models.registry import ModelBundle
 from app.storage.s3_client import S3Client
 
-# ID_COL = "customer_mdm_id"
-# DATE_COL = "partition_report_dt"
-
 
 @dataclass
 class ValidationResult:
@@ -23,7 +20,9 @@ class ValidationResult:
     total_rows: int
 
 
-def validate_input_parquet(s3_input_prefix: str, bundle: ModelBundle, s3_client: S3Client) -> ValidationResult:
+def validate_input_parquet(
+    s3_input_prefix: str, bundle: ModelBundle, s3_client: S3Client
+) -> ValidationResult:
     """
     Открывает входной префикс как pyarrow.dataset (объединяет схему всех
     парт-файлов под префиксом без чтения данных построчно), затем:

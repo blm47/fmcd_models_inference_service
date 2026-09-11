@@ -1,0 +1,27 @@
+stateDiagram-v2
+    state "QUEUED: ожидает исполнителя" as QUEUED
+    state "RUNNING: выполняется расчёт" as RUNNING
+    state "FINALIZING: публикуется результат" as FINALIZING
+    state "DONE: успешно завершена" as DONE
+    state "ABORTING: запрошена отмена" as ABORTING
+    state "ABORTED: отменена" as ABORTED
+    state "FAILED: завершена с ошибкой" as FAILED
+
+    [*] --> QUEUED: Заявка сохранена
+    QUEUED --> RUNNING: Свободный под забрал задачу
+    RUNNING --> FINALIZING: Все чанки обработаны, отмены нет
+    FINALIZING --> DONE: _SUCCESS и итоговый статус сохранены
+    QUEUED --> ABORTED: Отмена до запуска
+    RUNNING --> ABORTING: Принят запрос отмены
+    ABORTING --> ABORTED: Исполнитель остановил расчёт
+    RUNNING --> FAILED: Ошибка, shutdown или таймаут
+    ABORTING --> FAILED: Ошибка, shutdown или таймаут
+    FINALIZING --> FAILED: Ошибка, таймаут или shutdown до публикации
+    DONE --> [*]
+    ABORTED --> [*]
+    FAILED --> [*]
+
+    note right of FAILED
+        Повтор создаёт новую задачу.
+        Перехода FAILED → RUNNING нет.
+    end note
