@@ -3,20 +3,16 @@
 import unittest
 from pathlib import Path
 
-import yaml
 from fastapi.testclient import TestClient
 
 from app.main import app
-from scripts.export_openapi import render_html
+from scripts.export_openapi import render_markdown
 
 
 class OpenApiTests(unittest.TestCase):
-    def test_exported_schema_is_current(self):
-        exported_path = Path(__file__).resolve().parents[1] / "docs" / "openapi.yaml"
-        exported = yaml.safe_load(exported_path.read_text(encoding="utf-8"))
-        self.assertEqual(exported, app.openapi())
-        html_path = exported_path.with_name("swagger.html")
-        self.assertEqual(html_path.read_text(encoding="utf-8"), render_html(app.openapi()))
+    def test_exported_markdown_is_current(self):
+        path = Path(__file__).resolve().parents[1] / "docs" / "swagger.md"
+        self.assertEqual(path.read_text(encoding="utf-8"), render_markdown(app.openapi()))
 
     def test_documentation_endpoints(self):
         client = TestClient(app)
