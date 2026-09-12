@@ -52,6 +52,13 @@ python scripts/export_openapi.py
 
 ## Вызов из Airflow
 
+[HadoopToS3Operator](docs/hadoop-to-s3-operator.md) выполняет подготовку данных,
+опциональную выгрузку метаданных и подсчёт parquet текущей загрузки.
+
+Готовый [ModelInferenceOperator для Airflow 2.6.3](docs/airflow-operator.md)
+отправляет заявки без авторизации через `service_url` и ждёт в режиме `reschedule`.
+Поддерживает один префикс или шарды `partition_by=0..n_shards-1`.
+
 1. Airflow подготавливает входной префикс: `_SUCCESS` и `part-*.parquet`.
    Во время ожидания в очереди и расчёта входные данные должны оставаться неизменными.
 2. Отправляет `POST /infer` со стабильным ключом **одной попытки расчёта**:
