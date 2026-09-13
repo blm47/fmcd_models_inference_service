@@ -103,6 +103,7 @@ class HadoopToS3Operator(SparkSubmitOperator):
         Сохраняет аргументы; значения шаблонов проверяются после рендеринга.
 
         :param query_path: Путь к файлу SQL, который Spark получает через --files.
+            Если не задан, clear_s3_path=True включает только очистку без записи.
         :param object_name: Наименование витрины для метаданных и имени CSV-файла.
         :param endpoint: URL S3, если подключение задано без connection_name.
         :param access_key: Access key для подключения к S3.
@@ -164,7 +165,7 @@ class HadoopToS3Operator(SparkSubmitOperator):
             raise ValueError(
                 "Не указан connection_name или endpoint, access_key, secret_key, s3_bucket"
             )
-        
+
         # Сохраняем совместимость с опечаткой в старых DAG исходной библиотеки.
         if "mertics_calc_variables" in kwargs:
             metrics_calc_variables = kwargs.pop("mertics_calc_variables")
@@ -309,11 +310,11 @@ class HadoopToS3Operator(SparkSubmitOperator):
                 "load_start_time": dt.datetime.now().strftime(self._dt_formatter),
             }
         )
-        
+
         context["ti"].xcom_push(key="mark_loaded_at", value=timezone.utcnow().isoformat())
         self.log.info("Запуск загрузки данных")
         self._run_spark_job(True, context)
-        if self._meta_variables:
+        if self._meta_variables and self._query_path:
             self.log.info("Запуск загрузки метаданных")
             self._hook = None
             self._run_spark_job(False, context)

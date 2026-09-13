@@ -67,6 +67,22 @@ Operator = load_operator()
 
 
 class HadoopOperatorTests(unittest.TestCase):
+    def test_cleanup_without_query_skips_metadata_job(self):
+        operator = Operator(
+            endpoint="https://s3.example",
+            s3_bucket="data",
+            access_key="test",
+            secret_key="test",
+            clear_s3_path=True,
+            add_load_id=False,
+            count_loaded_keys=False,
+        )
+        operator.execute(self.context)
+        self.assertEqual(len(operator.jobs), 1)
+        self.assertIsNone(operator.jobs[0]["query_path"])
+        self.assertTrue(operator.jobs[0]["clear_s3_path"])
+        self.assertTrue(operator.jobs[0]["use_bulk_committer"])
+
     def test_sharding_parameters_reach_both_jobs(self):
         operator = self.operator(
             shard_column="customer_mdm_id",

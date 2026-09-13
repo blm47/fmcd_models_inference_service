@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import ssl
 import sys
 import types
 import unittest
@@ -69,6 +70,31 @@ Operator = load_operator()
 
 
 class InferenceOperatorTests(unittest.TestCase):
+    def test_tls_verification_for_submission_status_and_abort(self):
+        for verify in (True, False):
+            operator = self.operator(verify_ssl=verify)
+            operator.service_url = "https://inference.example"
+            for method, path in (
+                ("POST", "/infer"),
+                ("GET", "/tasks/id/status"),
+                ("POST", "/tasks/id/abort"),
+            ):
+                with self.subTest(verify=verify, path=path):
+                    with patch.dict(
+                        Operator._http.__globals__,
+                        urlopen=lambda *a, verify=verify, **kw: self.tls_response(kw, verify),
+                    ):
+                        Operator._http(operator, method, path)
+        self.assertTrue(self.operator().verify_ssl)
+        with self.assertRaises(ValueError):
+            self.operator(verify_ssl="False")
+
+    def tls_response(self, kwargs, verify):
+        context = kwargs["context"]
+        self.assertEqual(context.check_hostname, verify)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED if verify else ssl.CERT_NONE)
+        return io.BytesIO(b"{}")
+
     def setUp(self):
         self.context = {
             "ti": types.SimpleNamespace(

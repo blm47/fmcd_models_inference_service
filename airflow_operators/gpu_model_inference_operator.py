@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import time
 import uuid
 from urllib.error import HTTPError, URLError
@@ -50,8 +51,13 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         poke_interval: float = 60,
         timeout: float = 86400,
         request_timeout: float = 30,
+        verify_ssl: bool = True,
         **kwargs,
     ):
+        """
+        :param verify_ssl: Проверять сертификат и имя HTTPS-сервиса, по умолчанию True.
+            False отключает проверку для запуска, опроса и отмены инференса.
+        """
         # Не наследуем автоматические retries из default_args DAG.
         kwargs.setdefault("retries", 0)
         kwargs.setdefault("mode", "reschedule")
@@ -63,6 +69,8 @@ class GPUModelInferenceOperator(BaseSensorOperator):
             )
         if request_timeout <= 0:
             raise ValueError("request_timeout должен быть положительным")
+        if not isinstance(verify_ssl, bool):
+            raise ValueError("verify_ssl должен быть bool")
         super().__init__(poke_interval=poke_interval, timeout=timeout, **kwargs)
         self.service_url = service_url
         self.s3_input_prefix = s3_input_prefix
@@ -71,6 +79,7 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         self.partition_by = partition_by
         self.n_shards = n_shards
         self.request_timeout = request_timeout
+        self.verify_ssl = verify_ssl
         self._tasks = {}
 
     def _requests(self, context):
@@ -112,6 +121,10 @@ class GPUModelInferenceOperator(BaseSensorOperator):
     def _http(self, method, path, payload=None):
         """Повторяет временные HTTP-ошибки с тем же телом и ключом запроса."""
         data = None if payload is None else json.dumps(payload).encode("utf-8")
+        tls_context = ssl.create_default_context()
+        if not self.verify_ssl:
+            tls_context.check_hostname = False
+            tls_context.verify_mode = ssl.CERT_NONE
         for attempt in range(3):
             try:
                 request = Request(
@@ -120,7 +133,9 @@ class GPUModelInferenceOperator(BaseSensorOperator):
                     method=method,
                     headers={"Content-Type": "application/json"},
                 )
-                with urlopen(request, timeout=self.request_timeout) as response:
+                with urlopen(
+                    request, timeout=self.request_timeout, context=tls_context
+                ) as response:
                     result = json.load(response)
                 if not isinstance(result, dict):
                     raise AirflowException(f"Некорректный ответ {method} {path}")

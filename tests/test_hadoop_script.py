@@ -20,6 +20,65 @@ def encode(payload):
 
 
 class HadoopScriptTests(unittest.TestCase):
+    def test_cleanup_without_sql_does_not_write_data_or_metadata(self):
+        self.args.update(query_path=None, clear_s3_path=True, add_load_id=False)
+        java_path = self.spark._jvm.org.apache.hadoop.fs.Path.return_value
+        fs = java_path.getFileSystem.return_value
+        fs.exists.return_value = True
+        fs.delete.return_value = True
+        with patch.object(driver, "write_metadata") as metadata:
+            driver.run(self.spark, self.args, self.logger)
+        self.spark._jvm.org.apache.hadoop.fs.Path.assert_called_once_with("s3a://data/dataset")
+        fs.delete.assert_called_once_with(java_path, True)
+        self.spark.sql.assert_not_called()
+        metadata.assert_not_called()
+
+    def test_cleanup_uses_load_id_and_accepts_missing_path(self):
+        self.args.update(query_path=None, clear_s3_path=True)
+        fs = self.spark._jvm.org.apache.hadoop.fs.Path.return_value.getFileSystem.return_value
+        fs.exists.return_value = False
+        driver.run(self.spark, self.args, self.logger)
+        self.spark._jvm.org.apache.hadoop.fs.Path.assert_called_once_with(
+            "s3a://data/dataset/load_id=current"
+        )
+        fs.delete.assert_not_called()
+        self.spark.sql.assert_not_called()
+
+    def test_cleanup_failure_is_reported(self):
+        self.args.update(query_path=None, clear_s3_path=True)
+        fs = self.spark._jvm.org.apache.hadoop.fs.Path.return_value.getFileSystem.return_value
+        fs.exists.return_value = True
+        fs.delete.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "Не удалось очистить"):
+            driver.run(self.spark, self.args, self.logger)
+
+    def test_no_query_never_cleans_during_metadata_or_without_flag(self):
+        self.args.update(query_path=None, clear_s3_path=True, use_bulk_committer=False)
+        driver.run(self.spark, self.args, self.logger)
+        self.args.update(clear_s3_path=False, use_bulk_committer=True)
+        with self.assertRaises(ValueError):
+            driver.run(self.spark, self.args, self.logger)
+        self.spark._jvm.org.apache.hadoop.fs.Path.assert_not_called()
+        self.spark.sql.assert_not_called()
+
+    def test_logger_writes_to_stdout_immediately_without_duplicates(self):
+        output = io.StringIO()
+        with patch.object(driver.sys, "stdout", output), patch.object(output, "flush") as flush:
+            logger = driver.initialize_logger()
+            logger = driver.initialize_logger()
+            try:
+                for level in ("info", "warning", "error"):
+                    getattr(logger, level)(f"Сообщение {level}")
+                    self.assertIn(f"Сообщение {level}", output.getvalue())
+                self.assertEqual(flush.call_count, 3)
+                self.assertEqual(len(output.getvalue().splitlines()), 3)
+                self.assertFalse(logger.propagate)
+                self.assertEqual(len(logger.handlers), 1)
+            finally:
+                for handler in logger.handlers[:]:
+                    logger.removeHandler(handler)
+                    handler.close()
+
     def test_sharding_is_independent_of_write_parallelism(self):
         for count in (1, 36):
             args = driver.normalize_args(

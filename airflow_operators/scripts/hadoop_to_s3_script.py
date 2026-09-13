@@ -2,7 +2,9 @@ import argparse
 import base64
 import datetime as dt
 import json
+import logging
 import re
+import sys
 import uuid
 import zlib
 from contextlib import closing
@@ -65,7 +67,7 @@ def normalize_args(raw):
         args["shard_id_column"] = column_name(args["shard_id_column"], "shard_id_column")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args["shard_id_column"]):
             raise ValueError("shard_id_column должен быть простым SQL-идентификатором")
-        
+
     parts = args["partition_by"]
     parts = [parts] if isinstance(parts, str) else list(parts or [])
     parts = [column_name(part, "partition_by") for part in parts]
@@ -112,7 +114,7 @@ def wrap_query(sql, shard_column, num_shards, shard_id_column="shard_id"):
     ]
     if len(statements) != 1 or statements[0].get_type() != "SELECT":
         raise ValueError("Для шардирования нужен один SELECT, допускается WITH ... SELECT")
-    
+
     # Удаляем разделитель statement, не затрагивая ';' внутри строк и комментариев.
     query = "".join(
         t.value
@@ -224,15 +226,22 @@ def build_spark_conf(args):
     return conf
 
 
+def clear_data(spark, path):
+    """
+    Удаляет текущий путь данных; отсутствие пути считается успешной очисткой.
+    """
+    java_path = spark._jvm.org.apache.hadoop.fs.Path(path)
+    fs = java_path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
+    if fs.exists(java_path) and not fs.delete(java_path, True):
+        raise RuntimeError("Не удалось очистить указанный выходной префикс")
+
+
 def write_data(spark, frame, args, path):
     """
     Записывает данные целиком или по колонкам partition_by.
     """
     if args["clear_s3_path"]:
-        java_path = spark._jvm.org.apache.hadoop.fs.Path(path)
-        fs = java_path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
-        if fs.exists(java_path) and not fs.delete(java_path, True):
-            raise RuntimeError("Не удалось очистить указанный выходной префикс")
+        clear_data(spark, path)
     writer = frame.repartition(args["repartition"]).write.mode(args["mode"])
     if args["partition_by"]:
         writer = writer.partitionBy(*args["partition_by"])
@@ -324,7 +333,7 @@ def write_metadata(spark, frame, args, path, logger):
     meta = deepcopy(args.get("meta_variables") or {})
     if not meta:
         return
-    
+
     header = as_bool(meta.pop("header", False), "header")
     calc_meta = {
         **(args.get("calc_meta") or {}),
@@ -343,12 +352,12 @@ def write_metadata(spark, frame, args, path, logger):
             meta[key] = value
     if not meta:
         return
-    
+
     metadata_frame = pd.DataFrame({key: [value] for key, value in meta.items()})
     if not args["use_parquet_for_meta"] and args["no_delete_meta_file"]:
         append_csv_boto(spark, args, metadata_frame, logger)
         return
-    
+
     metadata = spark.createDataFrame(metadata_frame)
     if args["use_parquet_for_meta"]:
         metadata.coalesce(1).write.mode(args["mode"]).option("header", header).parquet(path)
@@ -373,11 +382,20 @@ def run(spark, args, logger):
     """
     Выполняет запрос и выбранную фазу выгрузки.
     """
+    if not args.get("query_path"):
+        if not args["use_bulk_committer"]:
+            logger.info("SQL не задан; запись метаданных пропущена")
+            return
+        if not args["clear_s3_path"]:
+            raise ValueError("Нужно передать query_path или включить clear_s3_path")
+        data_path = destination(args)
+        logger.info(f"Очистка S3 без записи данных: {data_path}")
+        clear_data(spark, data_path)
+        logger.info(f"Очистка S3 завершена: {data_path}")
+        return
+
     from jinja2 import Template
 
-    if not args.get("query_path"):
-        raise ValueError("Нужно передать query_path")
-    
     data_path = destination(args)
     meta_path = destination(args, metadata=True) if args.get("meta_variables") else None
 
@@ -391,8 +409,9 @@ def run(spark, args, logger):
     sql = Template(read_sql_file(args["query_path"])).render(args.get("template_variables") or {})
     if args["use_bulk_committer"] and args["num_shards"] is not None:
         sql = wrap_query(sql, args["shard_column"], args["num_shards"], args["shard_id_column"])
-        
+
     # Spark проверяет ссылки на колонки; дубли в итоговой схеме проверяем до очистки S3.
+    logger.info("Выполнение SQL и проверка наличия данных")
     frame = spark.sql(sql)
     if args["use_bulk_committer"]:
         validate_columns(
@@ -404,10 +423,12 @@ def run(spark, args, logger):
         logger.info("Данных во входной таблице нет; запись пропущена")
         return
     if args["use_bulk_committer"]:
+        logger.info(f"Запись Parquet в S3: {data_path}")
         write_data(spark, frame, args, data_path)
         logger.info("Данные записаны: " + data_path)
     else:
         # Метаданные не шардируются, эта фаза не очищает путь данных.
+        logger.info(f"Расчёт и запись метаданных: {meta_path}")
         write_metadata(spark, frame, args, meta_path, logger)
 
 
@@ -415,15 +436,16 @@ def main():
     """
     Создаёт SparkSession и единый logger, освобождает Spark после выполнения.
     """
+    logger = initialize_logger()
     parser = argparse.ArgumentParser()
     parser.add_argument("--application_args_encoded", required=True)
     args = normalize_args(decode_payload(parser.parse_args().application_args_encoded))
     from pyspark.sql import SparkSession
 
+    logger.info("Инициализация SparkSession")
     spark = (
         SparkSession.builder.config(conf=build_spark_conf(args)).enableHiveSupport().getOrCreate()
     )
-    logger = initialize_logger(spark)
     try:
         # Используем установленный в окружении S3A-коннектор.
         spark._jvm.org.apache.hadoop.fs.FileSystem.getFileSystemClass(
@@ -434,11 +456,22 @@ def main():
         spark.stop()
 
 
-def initialize_logger(spark):
+def initialize_logger():
     """
-    Получает единый logger с форматом и appenders, настроенными окружением Spark.
+    Настраивает вывод Python-скрипта в stdout независимо от Log4j кластера.
     """
-    return spark._jvm.org.apache.log4j.LogManager.getLogger("HadoopToS3")
+    logger = logging.getLogger("HadoopToS3")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    # Повторная инициализация не должна дублировать сообщения.
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    # StreamHandler делает flush после каждого сообщения.
+    logger.addHandler(handler)
+    return logger
 
 
 if __name__ == "__main__":
