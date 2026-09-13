@@ -70,6 +70,47 @@ Operator = load_operator()
 
 
 class InferenceOperatorTests(unittest.TestCase):
+    def test_progress_is_logged_on_every_poll_and_100_is_not_done(self):
+        operator = self.operator()
+        payload = operator._requests(self.context)[0]
+        key = payload["idempotency_key"]
+        self.tasks[key] = {
+            "task_id": key,
+            "status": "RUNNING",
+            "processed_rows": 25,
+            "total_rows": 100,
+            "progress_pct": 25.0,
+            "eta_seconds": 120.0,
+        }
+        with self.assertRaises(AirflowRescheduleException):
+            operator.execute(self.context)
+        message = operator.log.info.call_args.args[0]
+        self.assertIn("прогресс=25.0%", message)
+        self.assertIn("строк=25/100", message)
+        self.assertIn("ETA=120 с", message)
+        self.tasks[key].update(processed_rows=100, progress_pct=100.0, eta_seconds=0.0)
+        with self.assertRaises(AirflowRescheduleException):
+            operator.execute(self.context)
+        self.assertEqual(operator.log.info.call_count, 2)
+        self.assertIn("ETA=0 с", operator.log.info.call_args.args[0])
+
+    def test_unavailable_eta_and_zero_progress_are_logged(self):
+        operator = self.operator()
+        key = operator._requests(self.context)[0]["idempotency_key"]
+        self.tasks[key] = {
+            "task_id": key,
+            "status": "QUEUED",
+            "processed_rows": 0,
+            "total_rows": 100,
+            "progress_pct": 0.0,
+            "eta_seconds": None,
+        }
+        with self.assertRaises(AirflowRescheduleException):
+            operator.execute(self.context)
+        message = operator.log.info.call_args.args[0]
+        self.assertIn("прогресс=0.0%", message)
+        self.assertIn("ETA=нет оценки", message)
+
     def test_tls_verification_for_submission_status_and_abort(self):
         for verify in (True, False):
             operator = self.operator(verify_ssl=verify)

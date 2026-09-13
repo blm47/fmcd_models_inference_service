@@ -187,7 +187,15 @@ class GPUModelInferenceOperator(BaseSensorOperator):
                 task = self._http("GET", f"/tasks/{quote(task_id, safe='')}/status")
                 self._tasks[task_id] = task
                 status = task["status"]
-                self.log.info(f"Инференс {task_id}: {status}, выход={payload['s3_output_path']}")
+                progress = task.get("progress_pct")
+                eta = task.get("eta_seconds")
+                progress_text = "нет данных" if progress is None else f"{progress:.1f}%"
+                eta_text = "нет оценки" if eta is None else f"{eta:.0f} с"
+                self.log.info(
+                    f"Инференс {task_id}: {status}, прогресс={progress_text}, "
+                    f"строк={task.get('processed_rows', '?')}/{task.get('total_rows', '?')}, "
+                    f"ETA={eta_text}, выход={payload['s3_output_path']}"
+                )
                 if status in {"FAILED", "ABORTED", "ABORTING"}:
                     errors.append(f"{task_id}: {status}, причина={task.get('error')}")
                 elif status not in {"QUEUED", "RUNNING", "FINALIZING", "DONE"}:
