@@ -9,10 +9,9 @@ sequenceDiagram
     participant W as Свободный GPU-под
 
     Note over A,SP: Кастомные операторы hadoop_2_S3 и S3_2_Hadoop запускают Spark jobs.<br/>Airflow передаёт параметры и получает статус, parquet через него не проходит.
-    A->>SP: hadoop_2_S3 — spark-submit
+    A->>SP: hadoop_to_S3_Operator
     SP->>H: Прочитать исходные parquet / выполнить SQL
-    H-->>SP: Входные данные
-    SP->>S: Записать подготовленные parquet
+    H-->>S: Записать подготовленные parquet
     SP-->>A: Статус завершения выгрузки
     A->>API: POST /infer — модель, пути, ключ попытки
     API->>Q: Сохранить новую заявку
@@ -62,8 +61,7 @@ sequenceDiagram
     API->>Q: Прочитать состояние
     Q-->>API: DONE
     API-->>A: DONE
-    A->>SP: S3_2_Hadoop — spark-submit
+    A->>SP: S3_to_Hadoop_Operator
     SP->>S: Прочитать рассчитанные parquet
-    S-->>SP: Результаты модели
-    SP->>H: Записать parquet результата в Hadoop
+    S->>H: Записать parquet результата в Hadoop
     SP-->>A: Статус завершения переноса
