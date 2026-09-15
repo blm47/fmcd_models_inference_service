@@ -1,13 +1,14 @@
 """
 Прямой перенос функции pandas_chunk_to_fmcd_batch из ноутбука моделистов без изменений
-логики. Вынесена в отдельный модуль, чтобы models/inference.py не разрастался.
+логики. Используется только backend fmcd_cc_dc после загрузки пакета моделистов.
 """
 
 import numpy as np
 import pandas as pd
 import torch
-from fmcd.data.base import FMCDBatch
-from fmcd.data.production import ProdSchema
+
+from app.models.backends.fmcd_cc_dc.utils.fmcd.data.base import FMCDBatch
+from app.models.backends.fmcd_cc_dc.utils.fmcd.data.production import ProdSchema
 
 
 def pandas_chunk_to_fmcd_batch(

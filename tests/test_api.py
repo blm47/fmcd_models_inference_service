@@ -14,6 +14,36 @@ from app.tasks.state import TaskStatus
 
 
 class ApiTests(unittest.TestCase):
+    def test_status_exposes_saved_utilization(self):
+        from app.tasks.utilization import UtilizationStatistics
+
+        task_id = self.submit().json()["task_id"]
+        self.store.claim_next("pod", {"cc"})
+        stats = UtilizationStatistics()
+        stats.add(
+            {
+                "cpu": 150,
+                "ram_mb": 500,
+                "ram_pct": 25,
+                "gpu": 80,
+                "gpu_ram_mb": 1000,
+                "gpu_ram_pct": 50,
+            }
+        )
+        collector = Mock()
+        collector.snapshot.side_effect = stats.snapshot
+        with patch("app.tasks.state.UtilizationSampler", return_value=collector):
+            self.store.start_utilization(task_id, "cuda")
+            self.store.heartbeat(task_id)
+            self.store.finish_utilization(task_id)
+        response = self.client.get(f"/tasks/{task_id}/status")
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result["metrics_util_cpu_mean"], 150)
+        self.assertEqual(result["metrics_util_ram_mb_median"], 500)
+        self.assertEqual(result["metrics_util_gpu_ram_pct_max"], 50)
+        self.assertEqual(result["metrics_util_gpu_samples"], 1)
+
     def setUp(self):
         self.store = make_store(FakeS3())
         self.store.initialize()
@@ -63,7 +93,7 @@ class ApiTests(unittest.TestCase):
         second = self.submit()
         self.assertEqual(second.status_code, 202)
         self.assertEqual(second.json()["task_id"], first["task_id"])
-        self.assertEqual(self.validation.call_count, 1)
+        self.validation.assert_not_called()
 
     def test_new_attempt_after_failure_gets_new_id(self):
         first = self.submit().json()
@@ -103,9 +133,14 @@ class ApiTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.submit(s3_output_path=path).status_code, 422)
 
-    def test_output_success_marker_rejects_new_attempt(self):
+    def test_request_does_not_read_inputs_or_output(self):
         app.state.s3_client.prefix_has_results.return_value = True
-        self.assertEqual(self.submit().status_code, 422)
+        self.validation.side_effect = FileNotFoundError("нет входа")
+        response = self.submit()
+        self.assertEqual(response.status_code, 202)
+        self.assertIsNone(response.json()["total_rows"])
+        self.validation.assert_not_called()
+        self.assertEqual(app.state.s3_client.mock_calls, [])
 
     def test_idempotency_key_required(self):
         del self.request["idempotency_key"]

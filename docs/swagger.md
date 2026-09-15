@@ -7,7 +7,7 @@
 
 Асинхронный GPU-инференс над parquet в S3. Любой под принимает заявки, свободный worker забирает их из общей очереди S3.
 
-**Airflow:** подготовить вход → `POST /infer` → опрашивать `GET /tasks/{task_id}/status` → при `DONE` забрать результат в Hadoop.
+**Airflow:** hadoop_2_S3 запускает Spark job → `POST /infer` → опрашивать `GET /tasks/{task_id}/status` → при `DONE` S3_2_Hadoop запускает Spark job. Parquet передаётся между хранилищами через Spark, не через Airflow.
 
 **Статусы:** `QUEUED → RUNNING → FINALIZING → DONE`. Ошибка или таймаут переводит задачу в `FAILED`. Отмена: `QUEUED → ABORTED` или `RUNNING → ABORTING → ABORTED`.
 
@@ -20,7 +20,9 @@
 
 Принимает заявку независимо от занятости GPU текущего пода.
 
-До постановки проверяет модель, входные parquet и выходной префикс.
+До постановки проверяет имя модели и параметры запроса без чтения данных S3.
+Worker проверяет входные parquet, колонки, число строк и содержимое выхода.
+Ошибка этих проверок завершает принятую задачу как FAILED.
 Входные данные должны оставаться неизменными до завершения расчёта.
 Выход не должен содержать parquet или `_SUCCESS` и пересекаться с входом,
 системным файлом либо выходом незавершённой задачи.
@@ -41,8 +43,8 @@
 
 ```json
 {
-  "idempotency_key": "credit_cards/run-1/infer/attempt-1",
-  "model_name": "credit_cards",
+  "idempotency_key": "fmcd_credit_cards/run-1/infer/attempt-1",
+  "model_name": "fmcd_credit_cards",
   "s3_input_path": "s3://input-bucket/data/run-1",
   "s3_output_path": "s3://output-bucket/results/run-1"
 }
@@ -54,9 +56,9 @@
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 202 | Заявка сохранена или найдена ранее принятая попытка | application/json: [TaskAcceptedResponse](#taskacceptedresponse) |
-| 404 | Модель или входной префикс не найдены | application/json: [ErrorResponse](#errorresponse) |
+| 404 | Модель не найдена в конфигурации | application/json: [ErrorResponse](#errorresponse) |
 | 409 | Конфликт ключа, занятый выходной префикс или полная очередь | application/json: [ErrorResponse](#errorresponse) |
-| 422 | Некорректные параметры, колонки или непустой выход | application/json: [ErrorResponse](#errorresponse) |
+| 422 | Некорректные параметры запроса или пути S3 | application/json: [ErrorResponse](#errorresponse) |
 | 503 | S3 недоступен. Повторите запрос с прежним ключом | application/json: [ErrorResponse](#errorresponse) |
 
 </details>
@@ -260,8 +262,8 @@ Worker завершает текущую операцию и подтвержд�
 
 | Поле | Тип | Обязательно | Описание | Ограничения и примеры |
 | --- | --- | --- | --- | --- |
-| idempotency_key | string | да | Стабильный ключ одной попытки расчёта Airflow | maxLength: 256; minLength: 1; examples: [&quot;credit_cards/run-1/infer/attempt-1&quot;] |
-| model_name | string | да | Имя модели из configs/models.yaml | minLength: 1; examples: [&quot;credit_cards&quot;] |
+| idempotency_key | string | да | Стабильный ключ одной попытки расчёта Airflow | maxLength: 256; minLength: 1; examples: [&quot;fmcd_credit_cards/run-1/infer/attempt-1&quot;] |
+| model_name | string | да | Имя модели из configs/models.yaml | minLength: 1; examples: [&quot;fmcd_credit_cards&quot;] |
 | s3_input_path | string | да | Входной префикс внутри S3_BUCKET_IN с подготовленными parquet | examples: [&quot;s3://input-bucket/data/run-1&quot;] |
 | s3_output_path | string | да | Выходной префикс внутри S3_BUCKET_OUT без parquet и _SUCCESS | examples: [&quot;s3://output-bucket/results/run-1&quot;] |
 
@@ -289,7 +291,7 @@ Worker завершает текущую операцию и подтвержд�
 | task_id | string | да | Идентификатор задачи для опроса статуса и отмены | — |
 | pod_id | string &#124; null | да | Под-исполнитель, null до назначения | — |
 | status | [TaskStatus](#taskstatus) | да | Текущий статус, у новой заявки QUEUED | — |
-| total_rows | integer | да | Количество строк во входных данных | — |
+| total_rows | integer &#124; null | да | Количество входных строк, null до проверки worker | — |
 
 </details>
 
@@ -315,7 +317,7 @@ Worker завершает текущую операцию и подтвержд�
 | pod_id | string &#124; null | да | Назначенный под, null до захвата задачи | — |
 | status | [TaskStatus](#taskstatus) | да | DONE, FAILED и ABORTED — финальные статусы | — |
 | processed_rows | integer | да | Количество обработанных строк по сохранённому прогрессу | — |
-| total_rows | integer | да | Количество входных строк | — |
+| total_rows | integer &#124; null | да | Количество входных строк, null до проверки worker | — |
 | progress_pct | number | да | Прогресс в процентах. 100 ещё не означает DONE | — |
 | eta_seconds | number &#124; null | да | Оценка оставшихся секунд, null если недоступна | — |
 | error | string &#124; null | да | Причина ошибки или таймаута, null при отсутствии | — |
@@ -325,6 +327,36 @@ Worker завершает текущую операцию и подтвержд�
 | created_at | number | да | Создание задачи: Unix timestamp в секундах | — |
 | started_at | number &#124; null | да | Начало расчёта: Unix timestamp, null до старта | — |
 | finished_at | number &#124; null | да | Завершение: Unix timestamp, null до завершения | — |
+| metrics_util_cpu_min | number &#124; null | нет | cpu: min, %; null до первого измерения | — |
+| metrics_util_cpu_max | number &#124; null | нет | cpu: max, %; null до первого измерения | — |
+| metrics_util_cpu_mean | number &#124; null | нет | cpu: mean, %; null до первого измерения | — |
+| metrics_util_cpu_median | number &#124; null | нет | cpu: median, %; null до первого измерения | — |
+| metrics_util_cpu_samples | integer | нет | cpu: число успешных измерений | default: 0 |
+| metrics_util_ram_pct_min | number &#124; null | нет | ram_pct: min, %; null до первого измерения | — |
+| metrics_util_ram_pct_max | number &#124; null | нет | ram_pct: max, %; null до первого измерения | — |
+| metrics_util_ram_pct_mean | number &#124; null | нет | ram_pct: mean, %; null до первого измерения | — |
+| metrics_util_ram_pct_median | number &#124; null | нет | ram_pct: median, %; null до первого измерения | — |
+| metrics_util_ram_pct_samples | integer | нет | ram_pct: число успешных измерений | default: 0 |
+| metrics_util_ram_mb_min | number &#124; null | нет | ram_mb: min, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_ram_mb_max | number &#124; null | нет | ram_mb: max, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_ram_mb_mean | number &#124; null | нет | ram_mb: mean, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_ram_mb_median | number &#124; null | нет | ram_mb: median, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_ram_mb_samples | integer | нет | ram_mb: число успешных измерений | default: 0 |
+| metrics_util_gpu_min | number &#124; null | нет | gpu: min, %; null до первого измерения | — |
+| metrics_util_gpu_max | number &#124; null | нет | gpu: max, %; null до первого измерения | — |
+| metrics_util_gpu_mean | number &#124; null | нет | gpu: mean, %; null до первого измерения | — |
+| metrics_util_gpu_median | number &#124; null | нет | gpu: median, %; null до первого измерения | — |
+| metrics_util_gpu_samples | integer | нет | gpu: число успешных измерений | default: 0 |
+| metrics_util_gpu_ram_pct_min | number &#124; null | нет | gpu_ram_pct: min, %; null до первого измерения | — |
+| metrics_util_gpu_ram_pct_max | number &#124; null | нет | gpu_ram_pct: max, %; null до первого измерения | — |
+| metrics_util_gpu_ram_pct_mean | number &#124; null | нет | gpu_ram_pct: mean, %; null до первого измерения | — |
+| metrics_util_gpu_ram_pct_median | number &#124; null | нет | gpu_ram_pct: median, %; null до первого измерения | — |
+| metrics_util_gpu_ram_pct_samples | integer | нет | gpu_ram_pct: число успешных измерений | default: 0 |
+| metrics_util_gpu_ram_mb_min | number &#124; null | нет | gpu_ram_mb: min, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_gpu_ram_mb_max | number &#124; null | нет | gpu_ram_mb: max, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_gpu_ram_mb_mean | number &#124; null | нет | gpu_ram_mb: mean, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_gpu_ram_mb_median | number &#124; null | нет | gpu_ram_mb: median, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
+| metrics_util_gpu_ram_mb_samples | integer | нет | gpu_ram_mb: число успешных измерений | default: 0 |
 
 </details>
 

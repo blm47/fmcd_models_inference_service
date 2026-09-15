@@ -1,4 +1,6 @@
-"""Инициализация настроек, моделей и единственного потока очереди на поде."""
+"""
+Инициализация настроек, моделей и единственного потока очереди на поде.
+"""
 
 import asyncio
 import os
@@ -20,6 +22,7 @@ from app.api.schemas import HealthResponse
 from app.core.config import load_settings
 from app.core.logging import setup_logging
 from app.core.shutdown import install_shutdown_handlers, restore_shutdown_handlers
+from app.models.artifacts import download_model_artifacts
 from app.tasks.state import QueueConflictError, TaskStore
 from app.tasks.worker import consume_queue, monitor_queue
 
@@ -34,6 +37,10 @@ async def lifespan(app: FastAPI):
     started_threads = []
     try:
         settings = load_settings()
+        for model in settings.models:
+            await asyncio.to_thread(
+                download_model_artifacts, model.name, model.artifacts_dir, logger
+            )
         s3 = settings.s3
         queue = settings.task_store
         if not s3.verify_ssl:
@@ -58,12 +65,9 @@ async def lifespan(app: FastAPI):
         )
         store = TaskStore(client, s3.bucket_out, queue, logger)
         await asyncio.to_thread(store.initialize)
-        from app.models.loader import load_all_models
         from app.storage.s3_client import S3Client
 
-        models = await asyncio.to_thread(
-            load_all_models, settings.models, settings.inference, logger
-        )
+        models = {spec.name: spec for spec in settings.models}
         s3_client = S3Client(s3, logger)
         pod_id = os.environ.get("POD_NAME") or socket.gethostname()
         consumer = threading.Thread(
@@ -115,8 +119,9 @@ app = FastAPI(
     description=(
         "Асинхронный GPU-инференс над parquet в S3. Любой под принимает заявки, "
         "свободный worker забирает их из общей очереди S3.\n\n"
-        "**Airflow:** подготовить вход → `POST /infer` → опрашивать "
-        "`GET /tasks/{task_id}/status` → при `DONE` забрать результат в Hadoop.\n\n"
+        "**Airflow:** hadoop_2_S3 запускает Spark job → `POST /infer` → опрашивать "
+        "`GET /tasks/{task_id}/status` → при `DONE` S3_2_Hadoop запускает Spark job. "
+        "Parquet передаётся между хранилищами через Spark, не через Airflow.\n\n"
         "**Статусы:** `QUEUED → RUNNING → FINALIZING → DONE`. "
         "Ошибка или таймаут переводит задачу в `FAILED`. "
         "Отмена: `QUEUED → ABORTED` или `RUNNING → ABORTING → ABORTED`.\n\n"

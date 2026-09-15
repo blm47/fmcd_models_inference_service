@@ -8,13 +8,12 @@ RUN apt-get update && apt-get install -y python3.11 python3-pip ca-certificates 
 WORKDIR /srv/app
 
 COPY requirements.txt .
+COPY app/ ./app/
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Артефакты модели вшиты в образ на v1
 COPY artifacts/ ./artifacts/
 COPY configs/ ./configs/
-COPY fmcd/ ./fmcd/
-COPY app/ ./app/
 
 EXPOSE 8000
 

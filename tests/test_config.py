@@ -24,13 +24,23 @@ ENVIRONMENT = {
 
 
 class ConfigTests(unittest.TestCase):
+    def test_unknown_backend_and_old_global_settings_are_rejected(self):
+        raw = yaml.safe_load(Path("configs/models.yaml").read_text(encoding="utf-8"))
+        for changed in (
+            {**raw, "inference": {}},
+            {**raw, "models": [{**raw["models"][0], "backend": "unknown"}]},
+        ):
+            with patch("app.core.config.yaml.safe_load", return_value=changed):
+                with self.assertRaises(ValueError):
+                    load_settings()
+
     def test_yaml_is_not_overridden_by_env(self):
         with patch.dict(
             os.environ, {**ENVIRONMENT, "TASK_STORE_POLL_INTERVAL_SEC": "999"}, clear=True
         ):
             settings = load_settings()
         self.assertEqual(settings.task_store.poll_interval_sec, 3)
-        self.assertEqual(settings.models[0].id_cols, ["customer_mdm_id", "partition_report_dt"])
+        self.assertEqual(settings.models[0].id_cols, ("customer_mdm_id", "partition_report_dt"))
         self.assertFalse(settings.s3.verify_ssl)
 
     def test_each_s3_env_is_required(self):

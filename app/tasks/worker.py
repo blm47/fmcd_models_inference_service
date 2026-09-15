@@ -14,11 +14,13 @@ import time
 import traceback
 from typing import TYPE_CHECKING, Any
 
+from app.models.contracts import column_names
+from app.models.registry import create_bundle
 from app.tasks.state import TERMINAL_STATUSES, TaskState, TaskStatus, TaskStore
 
 if TYPE_CHECKING:
     from app.core.config import Settings
-    from app.models.registry import ModelBundle
+    from app.models.contracts import ModelSpec
     from app.storage.s3_client import S3Client
 
 
@@ -62,9 +64,15 @@ def _save_status(store, task_id, status, error, stop, logger) -> bool:
                 return False
 
 
+class TaskCancelled(Exception):
+    """
+    Кооперативная отмена между стадиями и infer-батчами.
+    """
+
+
 def run_task(
     task: TaskState,
-    bundle: ModelBundle,
+    spec: ModelSpec,
     settings: Settings,
     store: TaskStore,
     stop: threading.Event,
@@ -80,6 +88,11 @@ def run_task(
     heartbeat_thread = None
     heartbeat_started = False
     ownership_lost = threading.Event()
+    bundle = None
+    df_chunk = result_chunk = chunks = None
+    output_dtypes = None
+    load_complete = False
+    utilization_started = False
 
     def check_shutdown() -> None:
         if stop.is_set():
@@ -95,6 +108,10 @@ def run_task(
         store.update_progress(task_id, processed_rows, inference_elapsed_sec)
         if _save_status(store, task_id, TaskStatus.ABORTED, None, stop, logger):
             logger.info(f"Задача {task_id} отменена: processed_rows={processed_rows}")
+
+    def check_pipeline() -> None:
+        if cancelled():
+            raise TaskCancelled()
 
     try:
         heartbeat_thread = threading.Thread(
@@ -112,6 +129,34 @@ def run_task(
             return
 
         from app.models.inference import run_inference_on_chunk
+        from app.models.validation import validate_input_parquet
+
+        store.start_utilization(task_id, spec.device)
+        utilization_started = True
+        bundle = create_bundle(spec, logger)
+        logger.info(f"Задача {task_id}, модель={spec.name}: начало load")
+        bundle.load()
+        load_complete = True
+        logger.info(f"Задача {task_id}, модель={spec.name}: load завершён")
+        check_pipeline()
+        bundle.required_columns = column_names(
+            bundle.required_columns, "required_columns", allow_empty=True
+        )
+        bundle.output_columns = column_names(bundle.output_columns, "output_columns")
+        if set(spec.id_cols) & set(bundle.output_columns):
+            raise ValueError("Выходы pipeline не должны дублировать id_cols")
+        validation = validate_input_parquet(task.s3_input_path, bundle, s3_client)
+        if not validation.is_valid:
+            raise ValueError(f"missing_columns: {validation.missing_columns}")
+        if cancelled():
+            abort()
+            return
+        if store.set_total_rows(task_id, validation.total_rows) is False:
+            if cancelled():
+                abort()
+            return
+        task.total_rows = validation.total_rows
+        logger.info(f"Задача {task_id}: вход проверен, total_rows={task.total_rows}")
 
         # Ошибка инициализации также должна завершать задачу и освобождать слот.
         if s3_client.prefix_has_results(task.s3_output_path):
@@ -120,16 +165,28 @@ def run_task(
             )
         writer = s3_client.get_writer(task.s3_output_path)
 
-        for df_chunk in s3_client.iter_chunks(task.s3_input_path, settings.inference.chunk_size):
+        chunks = iter(s3_client.iter_chunks(task.s3_input_path, spec.parquet_read_chunk_size))
+        while True:
+            check_pipeline()
+            df_chunk = next(chunks, None)
+            if df_chunk is None:
+                break
             if cancelled():
                 abort()
                 return
 
+            if len(df_chunk) == 0:
+                continue
+
             started = time.perf_counter()
             result_chunk = run_inference_on_chunk(
-                df_chunk, bundle, settings.inference.infer_batch_size, check_shutdown
+                df_chunk, bundle, spec.infer_batch_size, check_pipeline
             )
             inference_elapsed_sec += time.perf_counter() - started
+            current_dtypes = tuple(result_chunk.dtypes)
+            if output_dtypes is not None and current_dtypes != output_dtypes:
+                raise ValueError("Типы результата изменились между чанками")
+            output_dtypes = current_dtypes
 
             if cancelled():
                 abort()
@@ -137,6 +194,7 @@ def run_task(
 
             writer.write_chunk(result_chunk)
             processed_rows += len(df_chunk)
+            df_chunk = result_chunk = None
 
             if (
                 time.monotonic() - last_progress_flush
@@ -146,6 +204,9 @@ def run_task(
                 last_progress_flush = time.monotonic()
 
         check_shutdown()
+
+        if processed_rows != task.total_rows:
+            raise ValueError("Количество прочитанных строк изменилось после проверки входа")
 
         # Проверка отмены и решение о завершении выполняются в одной мутации S3.
         # После FINALIZING API уже не принимает отмену: пишется маркер успеха.
@@ -161,12 +222,13 @@ def run_task(
         if _save_status(store, task_id, TaskStatus.DONE, None, stop, logger):
             logger.info(f"Задача {task_id} завершена: processed_rows={processed_rows}")
 
+    except TaskCancelled:
+        abort()
     except FileNotFoundError as exc:
-        logger.error((f"Задача {task_id}: путь S3 стал недоступен") + "\n" + traceback.format_exc())
+        reason = "s3_path_not_found" if load_complete else "model_artifact_not_found"
+        logger.error(f"Задача {task_id}: {reason}\n" + traceback.format_exc())
         if not success_written:
-            _save_status(
-                store, task_id, TaskStatus.FAILED, f"s3_path_not_found: {exc}", stop, logger
-            )
+            _save_status(store, task_id, TaskStatus.FAILED, f"{reason}: {exc}", stop, logger)
     except Exception as exc:
         if success_written:
             logger.error(
@@ -178,6 +240,31 @@ def run_task(
             logger.error((f"Задача {task_id} упала с ошибкой") + "\n" + traceback.format_exc())
             _save_status(store, task_id, TaskStatus.FAILED, str(exc), stop, logger)
     finally:
+        df_chunk = result_chunk = chunks = None
+        if bundle is not None:
+            try:
+                logger.info(f"Задача {task_id}, модель={spec.name}: начало close")
+                try:
+                    bundle.close()
+                finally:
+                    bundle = None
+                logger.info(f"Задача {task_id}, модель={spec.name}: close завершён")
+            except Exception:
+                stop.set()
+                logger.error(
+                    f"Задача {task_id}, модель={spec.name}: ошибка close; под остановлен\n"
+                    + traceback.format_exc()
+                )
+            finally:
+                bundle = None
+        if utilization_started:
+            try:
+                store.finish_utilization(task_id)
+            except Exception:
+                logger.error(
+                    f"Задача {task_id}: не удалось сохранить итоговую утилизацию\n"
+                    + traceback.format_exc()
+                )
         heartbeat_stop.set()
         if heartbeat_started and heartbeat_thread is not None:
             # Вызов S3 может ещё ожидать сетевой timeout. Поток daemon, а TaskStore

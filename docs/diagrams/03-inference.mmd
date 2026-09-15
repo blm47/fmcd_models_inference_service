@@ -8,7 +8,6 @@ sequenceDiagram
     participant Q as Общая очередь TaskStore
     participant W as Свободный GPU-под
 
-    Note over A,SP: Кастомные операторы hadoop_2_S3 и S3_2_Hadoop запускают Spark jobs.<br/>Airflow передаёт параметры и получает статус, parquet через него не проходит.
     A->>SP: hadoop_to_S3_Operator
     SP->>H: Прочитать исходные parquet / выполнить SQL
     H-->>S: Записать подготовленные parquet

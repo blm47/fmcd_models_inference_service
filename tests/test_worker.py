@@ -4,6 +4,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
+import pandas as pd
 from logger_stub import make_logger
 
 from app.tasks.state import TaskState, TaskStatus
@@ -21,9 +22,23 @@ class WorkerTests(unittest.TestCase):
             status=TaskStatus.RUNNING,
         )
         self.settings = types.SimpleNamespace(
-            inference=types.SimpleNamespace(chunk_size=2, infer_batch_size=1),
             task_store=types.SimpleNamespace(progress_update_interval_sec=120),
         )
+        self.spec = types.SimpleNamespace(
+            name="model",
+            device="cpu",
+            id_cols=("id",),
+            infer_batch_size=1,
+            parquet_read_chunk_size=2,
+        )
+        self.bundle = Mock()
+        self.bundle.required_columns = ()
+        self.bundle.output_columns = ("score",)
+        self.bundle.spec = self.spec
+        factory_patch = patch("app.tasks.worker.create_bundle", return_value=self.bundle)
+        self.factory = factory_patch.start()
+        self.addCleanup(factory_patch.stop)
+        self.frames = [pd.DataFrame({"id": [1, 2]}), pd.DataFrame({"id": [3, 4]})]
         self.cancel_event = threading.Event()
         self.logger = make_logger()
         self.remote_cancel = False
@@ -40,7 +55,7 @@ class WorkerTests(unittest.TestCase):
         self.s3 = Mock()
         self.s3.prefix_has_results.return_value = False
         self.s3.get_writer.return_value = self.writer
-        self.s3.iter_chunks.return_value = [[1, 2], [3, 4]]
+        self.s3.iter_chunks.return_value = self.frames
 
         inference_module = types.ModuleType("app.models.inference")
         self.infer = Mock(side_effect=lambda chunk, bundle, batch_size, checkpoint: chunk)
@@ -48,6 +63,13 @@ class WorkerTests(unittest.TestCase):
         inference_patch = patch.dict(sys.modules, {"app.models.inference": inference_module})
         inference_patch.start()
         self.addCleanup(inference_patch.stop)
+
+        validation_module = types.ModuleType("app.models.validation")
+        self.validation = Mock(return_value=types.SimpleNamespace(is_valid=True, total_rows=4))
+        validation_module.validate_input_parquet = self.validation
+        validation_patch = patch.dict(sys.modules, {"app.models.validation": validation_module})
+        validation_patch.start()
+        self.addCleanup(validation_patch.stop)
 
         # Сохраняем реальные потоки, чтобы проверить остановку heartbeat при выходе worker.
         thread_class = threading.Thread
@@ -78,7 +100,7 @@ class WorkerTests(unittest.TestCase):
     def run_worker(self):
         run_task(
             self.task,
-            object(),
+            self.spec,
             self.settings,
             self.store,
             self.cancel_event,
@@ -89,6 +111,88 @@ class WorkerTests(unittest.TestCase):
     def assert_worker_stopped(self):
         self.assertTrue(self.heartbeat_threads)
         self.assertTrue(all(not thread.is_alive() for thread in self.heartbeat_threads))
+        if self.factory.called:
+            self.bundle.close.assert_called_once_with()
+            self.store.start_utilization.assert_called_once_with(
+                self.task.task_id, self.spec.device
+            )
+            self.store.finish_utilization.assert_called_once_with(self.task.task_id)
+
+    def test_utilization_stops_after_model_close(self):
+        def finish(task_id):
+            self.bundle.close.assert_called_once_with()
+
+        self.store.finish_utilization.side_effect = finish
+        self.run_worker()
+        self.assert_worker_stopped()
+
+    def test_partial_load_failure_closes_without_validating_input(self):
+        self.bundle.load.side_effect = RuntimeError("partial load")
+        self.run_worker()
+        self.assertEqual(self.task.error, "partial load")
+        self.validation.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_close_error_preserves_done_and_stops_pod(self):
+        self.bundle.close.side_effect = RuntimeError("close failed")
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.DONE)
+        self.assertTrue(self.cancel_event.is_set())
+        self.assert_worker_stopped()
+
+    def test_close_error_does_not_mask_load_error(self):
+        self.bundle.load.side_effect = RuntimeError("load failed")
+        self.bundle.close.side_effect = RuntimeError("close failed")
+        self.run_worker()
+        self.assertEqual(self.task.error, "load failed")
+        self.assertTrue(self.cancel_event.is_set())
+        self.assert_worker_stopped()
+
+    def test_heartbeat_during_load_and_cancel_before_validation(self):
+        def load():
+            self.assertTrue(self.heartbeat_received.wait(timeout=2))
+            self.remote_cancel = True
+
+        self.bundle.load.side_effect = load
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.ABORTED)
+        self.validation.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_load_precedes_validation_and_uses_model_sizes(self):
+        def validate(*args):
+            self.bundle.load.assert_called_once_with()
+            return types.SimpleNamespace(is_valid=True, total_rows=4)
+
+        self.validation.side_effect = validate
+        self.run_worker()
+        self.s3.iter_chunks.assert_called_once_with(self.task.s3_input_path, 2)
+        self.assertEqual(self.infer.call_args.args[2], 1)
+        self.assert_worker_stopped()
+
+    def test_row_count_change_prevents_success(self):
+        self.validation.return_value.total_rows = 5
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.FAILED)
+        self.writer.close.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_dtype_change_between_chunks_prevents_second_write(self):
+        def infer(chunk, *args):
+            return chunk.astype(str) if chunk.id.iloc[0] == 3 else chunk
+
+        self.infer.side_effect = infer
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.FAILED)
+        self.writer.write_chunk.assert_called_once()
+        self.writer.close.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_chunk_write_failure_closes_model(self):
+        self.writer.write_chunk.side_effect = OSError("chunk write failed")
+        self.run_worker()
+        self.assertEqual(self.task.error, "chunk write failed")
+        self.assert_worker_stopped()
 
     def test_remote_abort_before_start_does_not_open_output(self):
         self.remote_cancel = True
@@ -99,6 +203,45 @@ class WorkerTests(unittest.TestCase):
         self.s3.get_writer.assert_not_called()
         self.infer.assert_not_called()
         self.assertFalse(self.cancel_event.is_set())
+        self.assert_worker_stopped()
+
+    def test_missing_columns_fail_before_inference_or_output(self):
+        self.validation.return_value = types.SimpleNamespace(
+            is_valid=False, missing_columns=["income"], total_rows=0
+        )
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.FAILED)
+        self.assertIn("missing_columns", self.task.error)
+        self.assertIn("income", self.task.error)
+        self.infer.assert_not_called()
+        self.s3.get_writer.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_missing_input_fails_in_worker(self):
+        self.validation.side_effect = FileNotFoundError("input")
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.FAILED)
+        self.assertIn("s3_path_not_found", self.task.error)
+        self.s3.get_writer.assert_not_called()
+        self.assert_worker_stopped()
+
+    def test_worker_saves_row_count_after_validation(self):
+        self.task.total_rows = None
+        self.run_worker()
+        self.store.set_total_rows.assert_called_once_with("task-1", 4)
+        self.assertEqual(self.task.total_rows, 4)
+        self.assertEqual(self.task.status, TaskStatus.DONE)
+
+    def test_cancel_during_validation_does_not_open_output(self):
+        def validate(*args):
+            self.remote_cancel = True
+            return types.SimpleNamespace(is_valid=True, total_rows=4)
+
+        self.validation.side_effect = validate
+        self.run_worker()
+        self.assertEqual(self.task.status, TaskStatus.ABORTED)
+        self.store.set_total_rows.assert_not_called()
+        self.s3.get_writer.assert_not_called()
         self.assert_worker_stopped()
 
     def test_remote_abort_during_input_read_stops_before_inference(self):
@@ -131,7 +274,8 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.task.status, TaskStatus.ABORTED)
         self.assertEqual(self.task.processed_rows, 2)
         self.assertGreaterEqual(self.task.inference_elapsed_sec, 0)
-        self.writer.write_chunk.assert_called_once_with([1, 2])
+        pd.testing.assert_frame_equal(self.writer.write_chunk.call_args.args[0], self.frames[0])
+        self.writer.write_chunk.assert_called_once()
         self.writer.close.assert_not_called()
         self.store.prepare_completion.assert_not_called()
         self.assertFalse(self.cancel_event.is_set())
@@ -139,7 +283,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_remote_abort_during_final_write_prevents_success_marker(self):
         def write(chunk):
-            if chunk == [3, 4]:
+            if chunk.equals(self.frames[1]):
                 self.remote_cancel = True
 
         self.writer.write_chunk.side_effect = write
@@ -147,12 +291,12 @@ class WorkerTests(unittest.TestCase):
 
         self.assertEqual(self.task.status, TaskStatus.ABORTED)
         self.assertEqual(self.task.processed_rows, 4)
-        self.store.prepare_completion.assert_called_once()
+        self.store.prepare_completion.assert_not_called()
         self.writer.close.assert_not_called()
         self.assert_worker_stopped()
 
     def test_shutdown_during_final_write_sets_failed(self):
-        self.s3.iter_chunks.return_value = [[1, 2]]
+        self.s3.iter_chunks.return_value = self.frames[:1]
         self.writer.write_chunk.side_effect = lambda chunk: self.cancel_event.set()
         self.run_worker()
 
@@ -198,6 +342,7 @@ class WorkerTests(unittest.TestCase):
 
     def test_empty_input_finalizes_with_zero_rows_and_success_marker(self):
         self.s3.iter_chunks.return_value = []
+        self.validation.return_value.total_rows = 0
         self.run_worker()
 
         self.assertEqual(self.task.status, TaskStatus.DONE)

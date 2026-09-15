@@ -1,87 +1,35 @@
 """
-Батчевый инференс одного чанка данных - прямой перенос логики из ноутбука
-моделистов:
-
-  pandas_chunk_to_fmcd_batch -> model(fmcd_batch) -> sigmoid(d_logits) ->
-  Platt калибрация (log_reg + logit) -> expm1-денормализация F/M/C/count.
+Общее разбиение чанка на батчи и проверка контракта результата pipeline.
 """
 
-from collections.abc import Callable
-
-import numpy as np
 import pandas as pd
-import torch
-
-from app.models.registry import ModelBundle
 
 
-def logit(p: np.ndarray) -> np.ndarray:
-    p = np.clip(p, 1e-7, 1 - 1e-7)
-    return np.log(p / (1 - p))
-
-
-def log_reg(intercept: float, coef: float, x: np.ndarray) -> np.ndarray:
-    z = intercept + coef * x
-    return 1.0 / (1.0 + np.exp(-z))
-
-
-def run_inference_on_chunk(
-    df_chunk: pd.DataFrame,
-    bundle: ModelBundle,
-    infer_batch_size: int,
-    check_shutdown: Callable[[], None],
-) -> pd.DataFrame:
+def run_inference_on_chunk(df_chunk, bundle, infer_batch_size, check_shutdown):
     """
-    Возвращает DataFrame с результатами (ID_COLS + d_prob_*/f_pred_*/
-    m_pred_*/c_pred_*/d_count_pred) для одного входного чанка, разбивая его
-    на под-батчи размера infer_batch_size для forward-pass модели.
+    Накапливает только результаты текущего чанка; бизнес-ключи не зависят от index.
     """
-    from app.models.pandas_to_fmcd import pandas_chunk_to_fmcd_batch  # локальный импорт, см. ниже
-
-    all_results = []
-
-    with torch.no_grad():
-        for start in range(0, len(df_chunk), infer_batch_size):
-            check_shutdown()
-            sub = df_chunk.iloc[start : start + infer_batch_size]
-
-            fmcd_batch = pandas_chunk_to_fmcd_batch(
-                sub, bundle.schema, bundle.num_cols, bundle.cat_cols
-            ).to(bundle.device)
-            out = bundle.model(fmcd_batch)
-            result = {id_col_name: sub[id_col_name].values for id_col_name in bundle.id_cols}
-
-            # D бинарные вероятности - с Platt calibration
-            d_probs_raw = torch.sigmoid(out.d_multilabel_logits).cpu().float().numpy()
-            for k, col in enumerate(bundle.d_cols):
-                calib = bundle.calibrators[col]
-                d_prob_calib = log_reg(
-                    calib["intercept"],
-                    calib["coef"],
-                    np.array(logit(d_probs_raw[:, k])).reshape(-1, 1),
-                ).reshape(1, -1)[0]
-                result[f"d_prob_{col}"] = d_prob_calib
-
-            # F - безусловное: d_prob_calib * expm1(f_log)
-            f_log = out.f_value_pred.cpu().float().numpy()
-            for k, (f_col, d_col) in enumerate(zip(bundle.f_cols, bundle.d_cols, strict=True)):
-                result[f"f_pred_{f_col}"] = result[f"d_prob_{d_col}"] * np.expm1(f_log[:, k])
-
-            # M - безусловное
-            m_log = out.m_value_pred.cpu().float().numpy()
-            for k, (m_col, d_col) in enumerate(zip(bundle.m_cols, bundle.d_cols, strict=True)):
-                result[f"m_pred_{m_col}"] = result[f"d_prob_{d_col}"] * np.expm1(m_log[:, k])
-
-            # C - безусловное
-            c_log = out.c_value_pred.cpu().float().numpy()
-            for k, (c_col, d_col) in enumerate(zip(bundle.c_cols, bundle.d_cols, strict=True)):
-                result[f"c_pred_{c_col}"] = result[f"d_prob_{d_col}"] * np.expm1(c_log[:, k])
-
-            result["d_count_pred"] = np.expm1(out.d_count_pred.cpu().float().numpy().squeeze(1))
-
-            all_results.append(pd.DataFrame(result))
-
-            torch.cuda.empty_cache()
-            check_shutdown()
-
-    return pd.concat(all_results, ignore_index=True)
+    results = []
+    expected_columns = list(bundle.spec.id_cols) + list(bundle.output_columns)
+    expected_dtypes = None
+    for start in range(0, len(df_chunk), infer_batch_size):
+        check_shutdown()
+        original = df_chunk.iloc[start : start + infer_batch_size]
+        frame = original.copy(deep=True)
+        result = bundle.predict_batch(frame, check_shutdown)
+        check_shutdown()
+        if not frame.equals(original):
+            raise ValueError("Pipeline изменил входной батч")
+        if not isinstance(result, pd.DataFrame) or len(result) != len(original):
+            raise ValueError("Pipeline должен вернуть DataFrame с одной строкой на входную")
+        if list(result.columns) != expected_columns:
+            raise ValueError("Колонки результата не соответствуют контракту pipeline")
+        keys = list(bundle.spec.id_cols)
+        if not result[keys].reset_index(drop=True).equals(original[keys].reset_index(drop=True)):
+            raise ValueError("Pipeline изменил значения, типы или порядок ключей")
+        dtypes = tuple(result.dtypes)
+        if expected_dtypes is not None and dtypes != expected_dtypes:
+            raise ValueError("Типы результата изменились между infer-батчами")
+        expected_dtypes = dtypes
+        results.append(result)
+    return pd.concat(results, ignore_index=True)

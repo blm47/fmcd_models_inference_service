@@ -66,6 +66,7 @@ def get_task_status(
         created_at=task.created_at,
         started_at=task.started_at,
         finished_at=task.finished_at,
+        **{key: value for key, value in vars(task).items() if key.startswith("metrics_util_")},
     )
 
 

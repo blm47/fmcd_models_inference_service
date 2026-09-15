@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -16,6 +17,7 @@ from typing import Any, TypeVar
 from botocore.exceptions import ClientError, ConnectionError, HTTPClientError
 
 from app.core.config import TaskStoreConfig
+from app.tasks.utilization import UtilizationSampler
 
 T = TypeVar("T")
 
@@ -45,7 +47,7 @@ class TaskState:
     s3_input_path: str
     s3_output_path: str
     status: TaskStatus
-    total_rows: int
+    total_rows: int | None
     idempotency_key: str | None = None
     pod_id: str | None = None
     processed_rows: int = 0
@@ -58,6 +60,36 @@ class TaskState:
     owner_id: str | None = None
     heartbeat_at: float | None = None
     cancel_requested: bool = False
+    metrics_util_cpu_min: float | None = None
+    metrics_util_cpu_max: float | None = None
+    metrics_util_cpu_mean: float | None = None
+    metrics_util_cpu_median: float | None = None
+    metrics_util_cpu_samples: int = 0
+    metrics_util_ram_pct_min: float | None = None
+    metrics_util_ram_pct_max: float | None = None
+    metrics_util_ram_pct_mean: float | None = None
+    metrics_util_ram_pct_median: float | None = None
+    metrics_util_ram_pct_samples: int = 0
+    metrics_util_ram_mb_min: float | None = None
+    metrics_util_ram_mb_max: float | None = None
+    metrics_util_ram_mb_mean: float | None = None
+    metrics_util_ram_mb_median: float | None = None
+    metrics_util_ram_mb_samples: int = 0
+    metrics_util_gpu_min: float | None = None
+    metrics_util_gpu_max: float | None = None
+    metrics_util_gpu_mean: float | None = None
+    metrics_util_gpu_median: float | None = None
+    metrics_util_gpu_samples: int = 0
+    metrics_util_gpu_ram_pct_min: float | None = None
+    metrics_util_gpu_ram_pct_max: float | None = None
+    metrics_util_gpu_ram_pct_mean: float | None = None
+    metrics_util_gpu_ram_pct_median: float | None = None
+    metrics_util_gpu_ram_pct_samples: int = 0
+    metrics_util_gpu_ram_mb_min: float | None = None
+    metrics_util_gpu_ram_mb_max: float | None = None
+    metrics_util_gpu_ram_mb_mean: float | None = None
+    metrics_util_gpu_ram_mb_median: float | None = None
+    metrics_util_gpu_ram_mb_samples: int = 0
 
     @property
     def progress_pct(self) -> float:
@@ -65,7 +97,7 @@ class TaskState:
 
     @property
     def eta_seconds(self) -> float | None:
-        if not self.processed_rows or self.status != TaskStatus.RUNNING:
+        if self.total_rows is None or not self.processed_rows or self.status != TaskStatus.RUNNING:
             return None
         return round(
             max(0, self.total_rows - self.processed_rows)
@@ -93,6 +125,8 @@ class TaskStore:
         # Идентификатор процесса не переиспользуется после рестарта пода.
         self.owner_id = uuid.uuid4().hex
         self.heartbeat_interval_sec = config.heartbeat_interval_sec
+        self._utilization = {}
+        self._utilization_lock = threading.Lock()
 
     @staticmethod
     def _encode(tasks: dict[str, TaskState], revision: int) -> bytes:
@@ -166,7 +200,7 @@ class TaskStore:
             raise TimeoutError("Истёк срок обновления очереди S3; повторите запрос с тем же ключом")
         time.sleep(min(remaining, random.uniform(0.5, 1.5) * self.config.cas_retry_interval_sec))
 
-    def _mutate(self, change: Callable[[dict[str, TaskState]], T]) -> T:
+    def _mutate(self, change: Callable[[dict[str, TaskState]], T], metrics_task_id=None) -> T:
         """
         Повторяет чистое идемпотентное изменение после конфликта или потери ответа PUT.
         """
@@ -175,7 +209,16 @@ class TaskStore:
             try:
                 tasks, etag, revision = self._read()
                 before = self._encode(tasks, revision)
+                previous = {key: asdict(task) for key, task in tasks.items()}
                 result = change(tasks)
+                with self._utilization_lock:
+                    collectors = dict(self._utilization)
+                for task_id, collector in collectors.items():
+                    task = tasks.get(task_id)
+                    if task is not None and task.owner_id == self.owner_id:
+                        if task_id == metrics_task_id or asdict(task) != previous.get(task_id):
+                            for key, value in collector.snapshot().items():
+                                setattr(task, key, value)
                 if self._encode(tasks, revision) == before:
                     return result
                 self.client.put_object(
@@ -191,6 +234,37 @@ class TaskStore:
                     raise
                 # GET после неопределённого PUT позволяет увидеть уже сохранённый результат.
                 self._pause(deadline)
+
+    def start_utilization(self, task_id: str, device: str) -> None:
+        """
+        Подключает локальный sampler к последующим CAS-записям задачи.
+        """
+        collector = UtilizationSampler(task_id, device, self.logger)
+        with self._utilization_lock:
+            if task_id in self._utilization:
+                raise RuntimeError(f"Сбор утилизации уже запущен: {task_id}")
+            self._utilization[task_id] = collector
+        try:
+            collector.start()
+        except BaseException:
+            with self._utilization_lock:
+                self._utilization.pop(task_id, None)
+            raise
+
+    def finish_utilization(self, task_id: str) -> None:
+        """
+        Останавливает sampler, сохраняет итог после close и удаляет локальную историю.
+        """
+        with self._utilization_lock:
+            collector = self._utilization.get(task_id)
+        if collector is None:
+            return
+        try:
+            collector.stop()
+            self._mutate(lambda tasks: None, metrics_task_id=task_id)
+        finally:
+            with self._utilization_lock:
+                self._utilization.pop(task_id, None)
 
     def get(self, task_id: str) -> TaskState | None:
         return self._read()[0].get(task_id)
@@ -216,7 +290,7 @@ class TaskStore:
         return None
 
     def enqueue(
-        self, key: str, model: str, input_path: str, output_path: str, total_rows: int
+        self, key: str, model: str, input_path: str, output_path: str, total_rows: int | None
     ) -> TaskState:
         task_id = str(uuid.uuid4())
 
@@ -296,6 +370,24 @@ class TaskStore:
                 task.heartbeat_at = time.time()
                 return True
             return False
+
+        return self._mutate(update)
+
+    def set_total_rows(self, task_id: str, total_rows: int) -> bool:
+        """
+        Сохраняет результат проверки входа владельцем, не сбрасывая таймаут прогресса.
+        """
+        if type(total_rows) is not int or total_rows < 0:
+            raise ValueError("total_rows: ожидается неотрицательное целое число")
+
+        def update(tasks):
+            task = tasks[task_id]
+            self._check_owner(task)
+            self._expire_task(task)
+            if task.status != TaskStatus.RUNNING:
+                return False
+            task.total_rows = total_rows
+            return True
 
         return self._mutate(update)
 

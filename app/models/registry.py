@@ -1,33 +1,31 @@
 """
-ModelBundle - всё, что нужно для инференса ОДНОЙ модели: веса + препроцессинг-
-артефакты. Сам реестр моделей - обычный dict[str, ModelBundle] (см.
-app/main.py: app.state.models), отдельный класс-обёртка не нужен, т.к.
-логика сводится к чтению по ключу без дополнительного поведения.
+Ленивый реестр backend: каталог не импортирует библиотеки моделей.
 """
 
-from dataclasses import dataclass
+from importlib import import_module
 from typing import Any
 
-import torch
-from fmcd.data.production import ProdSchema
+from app.models.contracts import ModelBundle, ModelSpec
+
+# TODO Нужна инструкция по добавлению нового backend и новой модели в README.md
+BACKENDS = {
+    "fmcd_cc_dc": "app.models.backends.fmcd_cc_dc.runner:FMCDCardsRunner",
+    "fmcd_invest": "app.models.backends.fmcd_invest.runner:FMCDInvestRunner",
+}
 
 
-@dataclass
-class ModelBundle:
+def validate_backend(backend: str) -> None:
+    if backend not in BACKENDS:
+        raise ValueError(f"Неизвестный backend: {backend}")
+
+
+def create_bundle(spec: ModelSpec, logger: Any) -> ModelBundle:
     """
-    Всё, что нужно для инференса ОДНОЙ модели: веса + препроцессинг-артефакты.
+    Создаёт новый экземпляр для задачи, не загружая веса в фабрике.
     """
-
-    name: str
-    model: Any  # torch.nn.Module (FMCDModel), тип из fmcd.model.fmcd_model
-    schema: ProdSchema
-    calibrators: dict  # Коэффициенты Platt calibration для каждого MCG.
-    device: torch.device
-
-    id_cols: list[str]
-    num_cols: list[str]
-    cat_cols: list[str]
-    d_cols: list[str]
-    f_cols: list[str]
-    m_cols: list[str]
-    c_cols: list[str]
+    validate_backend(spec.backend)
+    module_name, class_name = BACKENDS[spec.backend].split(":")
+    cls = getattr(import_module(module_name), class_name)
+    if not isinstance(cls, type) or not issubclass(cls, ModelBundle):
+        raise TypeError(f"Backend {spec.backend} должен наследовать ModelBundle")
+    return cls(spec, logger)
