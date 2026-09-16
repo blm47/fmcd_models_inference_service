@@ -1,28 +1,33 @@
 flowchart TB
     H[("Hadoop")]
-    subgraph AF["Airflow — отдельный DAG для каждой модели"]
-        E["Подготовка данных<br/>Hadoop → S3"]
-        OP["Кастомный оператор<br/>Запуск и ожидание расчёта"]
-        R["После DONE<br/>S3 → Hadoop"]
+    IN[("Входные parquet S3")]
+    OUT[("Результаты parquet S3")]
+    subgraph AF["Airflow — управление отдельным DAG каждой модели"]
+        E["hadoop_2_S3"]
+        OP["ModelInferenceOperator<br/>Запуск и ожидание расчёта"]
+        R["S3_2_Hadoop после DONE"]
         E --> OP --> R
     end
-    IN[("Входные данные S3")]
-    OUT[("Результаты S3")]
-    H --> E --> IN
-    OUT --> R --> H
-
+    subgraph SP["Spark — передача данных между хранилищами"]
+        JOBIN["Spark job Hadoop → S3"]
+        JOBOUT["Spark job S3 → Hadoop"]
+    end
+    E -.->|"spark-submit / статус"| JOBIN
+    R -.->|"spark-submit / статус"| JOBOUT
+    H -->|"parquet"| JOBIN --> IN
+    OUT -->|"parquet"| JOBOUT --> H
     subgraph K["Kubernetes — сервис инференса"]
-        API["API через балансировщик<br/>Приём заявок, статус, отмена"]
-        Q[("Общая очередь в S3<br/>Задачи и их статусы")]
-        P1["Под 1<br/>Один GPU worker"]
-        P2["Под 2<br/>Один GPU worker"]
-        M["Монитор на каждом поде<br/>Проверка таймаутов"]
+        API["API через балансировщик<br/>Заявки, статус, отмена"]
+        Q[("TaskStore: S3 / PostgreSQL<br/>Статусы и прогресс")]
+        P1["Под 1 — один worker"]
+        P2["Под 2 — один worker"]
+        M["Kubelet вызывает readiness<br/>Проверка таймаутов в ручке"]
         API <--> Q
         Q -->|"Задачу берёт свободный под"| P1
         Q --> P2
         P1 & P2 -->|"Прогресс и heartbeat"| Q
         M <--> Q
     end
-    OP <-->|"Запуск и проверка статуса"| API
+    OP <-->|"HTTP: запуск и статус"| API
     IN --> P1 & P2
     P1 & P2 --> OUT

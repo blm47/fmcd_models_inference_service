@@ -1,213 +1,123 @@
 """
-Общая очередь в одном объекте S3. Все изменения выполняются через CAS.
+Логика очереди, назначения исполнителей, отмены и таймаутов.
 """
 
 from __future__ import annotations
 
-import json
-import random
+import threading
 import time
 import uuid
-from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
-from enum import StrEnum
-from typing import Any, TypeVar
-
-from botocore.exceptions import ClientError, ConnectionError, HTTPClientError
+from typing import Any
 
 from app.core.config import TaskStoreConfig
-
-T = TypeVar("T")
-
-
-class TaskStatus(StrEnum):
-    QUEUED = "QUEUED"
-    RUNNING = "RUNNING"
-    DONE = "DONE"
-    FAILED = "FAILED"
-    ABORTING = "ABORTING"
-    ABORTED = "ABORTED"
-    FINALIZING = "FINALIZING"
-
-
-ACTIVE_STATUSES = (TaskStatus.RUNNING, TaskStatus.ABORTING, TaskStatus.FINALIZING)
-TERMINAL_STATUSES = (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED)
-
-
-class QueueConflictError(ValueError):
-    """Ключ запроса или выходной префикс уже занят другой задачей."""
-
-
-@dataclass
-class TaskState:
-    task_id: str
-    model_name: str
-    s3_input_path: str
-    s3_output_path: str
-    status: TaskStatus
-    total_rows: int
-    idempotency_key: str | None = None
-    pod_id: str | None = None
-    processed_rows: int = 0
-    created_at: float = field(default_factory=time.time)
-    started_at: float | None = None
-    updated_at: float = field(default_factory=time.time)
-    finished_at: float | None = None
-    error: str | None = None
-    inference_elapsed_sec: float = 0.0
-    owner_id: str | None = None
-    heartbeat_at: float | None = None
-    cancel_requested: bool = False
-
-    @property
-    def progress_pct(self) -> float:
-        return round(100 * self.processed_rows / self.total_rows, 1) if self.total_rows else 0.0
-
-    @property
-    def eta_seconds(self) -> float | None:
-        if not self.processed_rows or self.status != TaskStatus.RUNNING:
-            return None
-        return round(
-            max(0, self.total_rows - self.processed_rows)
-            * self.inference_elapsed_sec
-            / self.processed_rows,
-            1,
-        )
+from app.tasks.backends.base import TaskBackend
+from app.tasks.types import (
+    ACTIVE_STATUSES,
+    TERMINAL_STATUSES,
+)
+from app.tasks.types import (
+    QueueConflictError as QueueConflictError,
+)
+from app.tasks.types import (
+    TaskState as TaskState,
+)
+from app.tasks.types import (
+    TaskStatus as TaskStatus,
+)
 
 
 def prefixes_overlap(left: str, right: str) -> bool:
+    """
+    Проверяет пересечение выходных S3-префиксов для предотвращения конфликтов задач.
+
+    Префиксы пересекаются, если совпадают или один вложен в другой по границе «/».
+    Завершающие символы «/» игнорируются.
+    """
     left, right = left.rstrip("/"), right.rstrip("/")
     return left == right or left.startswith(right + "/") or right.startswith(left + "/")
 
 
 class TaskStore:
     """
-    Читает очередь, принимает заявки и назначает исполнителей.
+    Управляет очередью задач через backend для API и исполнителей.
+
+    Обеспечивает идемпотентность запросов, проверку конфликтов выходных S3-префиксов,
+    назначение задач, отмену, таймауты и retention. Изменения выполняются через
+    backend.mutate; owner_id определяет владельца задач для этого экземпляра.
     """
 
-    def __init__(self, client, bucket: str, config: TaskStoreConfig, logger: Any):
-        self.client = client
-        self.bucket = bucket
+    def __init__(self, backend: TaskBackend, config: TaskStoreConfig, logger: Any):
+        """
+        Сохраняет backend, настройки и общий logger, создаёт идентификатор владельца.
+        """
+        self.backend = backend
         self.config = config
         self.logger = logger
-        # Идентификатор процесса не переиспользуется после рестарта пода.
         self.owner_id = uuid.uuid4().hex
-        self.heartbeat_interval_sec = config.heartbeat_interval_sec
-
-    @staticmethod
-    def _encode(tasks: dict[str, TaskState], revision: int) -> bytes:
-        return json.dumps(
-            {"revision": revision, "tasks": {key: asdict(task) for key, task in tasks.items()}},
-            ensure_ascii=False,
-            sort_keys=True,
-            allow_nan=False,
-        ).encode("utf-8")
-
-    def _read(self) -> tuple[dict[str, TaskState], str, int]:
-        response = self.client.get_object(Bucket=self.bucket, Key=self.config.state_key)
-        body = response["Body"]
-        try:
-            raw = json.loads(body.read())
-        finally:
-            body.close()
-        # Пустой или повреждённый объект не превращаем в пустую очередь.
-        revision = raw.get("revision", 0)
-        if type(revision) is not int or revision < 0:
-            raise ValueError("Некорректная revision в очереди S3")
-        tasks = {}
-        for key, fields in raw["tasks"].items():
-            # Старые записи не содержат created_at; сохраняем стабильное время при миграции.
-            fields = dict(fields)
-            fields.setdefault("created_at", fields.get("started_at") or fields["updated_at"])
-            task = TaskState(**{**fields, "status": TaskStatus(fields["status"])})
-            if key != task.task_id:
-                raise ValueError("Ключ задачи не совпадает с task_id")
-            tasks[key] = task
-        etag = response["ETag"]
-        if self.config.strip_etag_quotes:
-            etag = etag.strip('"')
-        return tasks, etag, revision
+        self._maintenance_lock = threading.Lock()
+        self._next_cleanup = 0.0
 
     def initialize(self) -> None:
         """
-        Создаёт объект только при отсутствии; одновременный старт подов допустим.
+        Инициализирует backend перед началом работы с очередью.
         """
-        deadline = time.monotonic() + self.config.cas_timeout_sec
-        while True:
-            try:
-                self._read()
-                return
-            except ClientError as exc:
-                if exc.response["Error"]["Code"] not in ("NoSuchKey", "404"):
-                    raise
-            try:
-                self.client.put_object(
-                    Bucket=self.bucket,
-                    Key=self.config.state_key,
-                    Body=self._encode({}, 0),
-                    ContentType="application/json",
-                    IfNoneMatch="*",
-                )
-                self.logger.info(f"Создан файл очереди S3: {self.config.state_key}")
-                return
-            except (ClientError, ConnectionError, HTTPClientError) as exc:
-                if isinstance(exc, ClientError) and not self._retryable(exc):
-                    raise
-                self._pause(deadline)
+        self.backend.initialize()
 
-    @staticmethod
-    def _retryable(exc: ClientError) -> bool:
-        status = exc.response["ResponseMetadata"]["HTTPStatusCode"]
-        return status in (409, 412, 429) or status >= 500
-
-    def _pause(self, deadline: float) -> None:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("Истёк срок обновления очереди S3; повторите запрос с тем же ключом")
-        time.sleep(min(remaining, random.uniform(0.5, 1.5) * self.config.cas_retry_interval_sec))
-
-    def _mutate(self, change: Callable[[dict[str, TaskState]], T]) -> T:
+    def close(self) -> None:
         """
-        Повторяет чистое идемпотентное изменение после конфликта или потери ответа PUT.
+        Освобождает ресурсы backend при завершении работы.
         """
-        deadline = time.monotonic() + self.config.cas_timeout_sec
-        while True:
-            try:
-                tasks, etag, revision = self._read()
-                before = self._encode(tasks, revision)
-                result = change(tasks)
-                if self._encode(tasks, revision) == before:
-                    return result
-                self.client.put_object(
-                    Bucket=self.bucket,
-                    Key=self.config.state_key,
-                    Body=self._encode(tasks, revision + 1),
-                    ContentType="application/json",
-                    IfMatch=etag,
-                )
-                return result
-            except (ClientError, ConnectionError, HTTPClientError) as exc:
-                if isinstance(exc, ClientError) and not self._retryable(exc):
-                    raise
-                # GET после неопределённого PUT позволяет увидеть уже сохранённый результат.
-                self._pause(deadline)
+        self.backend.close()
 
     def get(self, task_id: str) -> TaskState | None:
-        return self._read()[0].get(task_id)
+        """
+        Возвращает состояние задачи по task_id или None, если задача отсутствует.
+        """
+        return self.backend.get(task_id)
 
     def find_request(
-        self, key: str, model: str, input_path: str, output_path: str
+        self,
+        key: str,
+        model: str,
+        input_path: str,
+        output_path: str,
+        calc_utilization: bool = False,
     ) -> TaskState | None:
-        return self._find_request(self._read()[0], key, model, input_path, output_path)
+        """
+        Находит задачу по ключу идемпотентности key или возвращает None.
+
+        Проверяет совпадение модели, входного и выходного S3-путей и флага
+        calc_utilization. При несовпадении параметров вызывает QueueConflictError.
+        """
+        task = self.backend.get_by_key(key)
+        return self._find_request(
+            {task.task_id: task} if task else {},
+            key,
+            model,
+            input_path,
+            output_path,
+            calc_utilization,
+        )
 
     @staticmethod
-    def _find_request(tasks, key, model, input_path, output_path):
+    def _find_request(tasks, key, model, input_path, output_path, calc_utilization=False):
+        """
+        Ищет запрос в tasks; конфликт параметров вызывает QueueConflictError.
+
+        Возвращает найденную задачу или None, если ключ ещё не использован.
+        """
         for task in tasks.values():
             if task.idempotency_key == key:
-                if (task.model_name, task.s3_input_path, task.s3_output_path) != (
+                if (
+                    task.model_name,
+                    task.s3_input_path,
+                    task.s3_output_path,
+                    task.calc_utilization,
+                ) != (
                     model,
                     input_path,
                     output_path,
+                    calc_utilization,
                 ):
                     raise QueueConflictError(
                         "Ключ идемпотентности уже использован с другими параметрами"
@@ -216,12 +126,30 @@ class TaskStore:
         return None
 
     def enqueue(
-        self, key: str, model: str, input_path: str, output_path: str, total_rows: int
+        self,
+        key: str,
+        model: str,
+        input_path: str,
+        output_path: str,
+        total_rows: int | None,
+        calc_utilization: bool = False,
     ) -> TaskState:
+        """
+        Атомарно ставит задачу в QUEUED или возвращает идентичный повторный запрос.
+
+        key задаёт ключ идемпотентности, model — имя модели, input_path и
+        output_path — S3-пути. total_rows содержит число входных строк либо None,
+        если оно ещё неизвестно; calc_utilization включает расчёт utilization.
+
+        Вызывает QueueConflictError при повторном ключе с другими параметрами,
+        пересечении выходного префикса с незавершённой задачей или заполнении очереди.
+        """
         task_id = str(uuid.uuid4())
 
         def add(tasks):
-            existing = self._find_request(tasks, key, model, input_path, output_path)
+            existing = self._find_request(
+                tasks, key, model, input_path, output_path, calc_utilization
+            )
             if existing:
                 return existing
             pending = [task for task in tasks.values() if task.status not in TERMINAL_STATUSES]
@@ -237,15 +165,23 @@ class TaskStore:
                 s3_output_path=output_path,
                 status=TaskStatus.QUEUED,
                 total_rows=total_rows,
+                calc_utilization=calc_utilization,
             )
             tasks[task_id] = task
             return task
 
-        return self._mutate(add)
+        return self.backend.mutate(add, idempotency_key=key)
 
     def claim_next(self, pod_id: str, model_names: set[str]) -> TaskState | None:
+        """
+        Назначает pod_id самую раннюю задачу из очереди для моделей model_names.
+
+        Переводит её в RUNNING и сохраняет владельца и время старта. Сначала
+        возвращает уже активную задачу этого владельца, если она есть.
+        Если подходящих задач нет, возвращает None.
+        """
         def claim(tasks):
-            # Восстанавливаем результат захвата, если ответ предыдущего PUT потерялся.
+            # Восстанавливаем результат захвата, если ответ предыдущей записи потерялся.
             owned = next(
                 (
                     task
@@ -267,41 +203,81 @@ class TaskStore:
             task.status = TaskStatus.RUNNING
             task.pod_id = pod_id
             task.owner_id = self.owner_id
-            task.started_at = task.updated_at = task.heartbeat_at = time.time()
+            task.started_at = task.last_modified = time.time()
             return task
 
-        return self._mutate(claim)
+        return self.backend.mutate(claim)
 
     def executor_alive(self, task: TaskState) -> bool:
-        last_seen = task.heartbeat_at if task.heartbeat_at is not None else task.updated_at
-        return (
-            task.status in ACTIVE_STATUSES
-            and time.time() - last_seen < self.config.heartbeat_timeout_sec
-        )
+        """
+        Проверяет активный статус и отсутствие таймаута без изменения задачи.
+        """
+        return task.status in ACTIVE_STATUSES and self._timeout_reason(task) is None
 
     def get_all_active(self) -> list[TaskState]:
-        # Просроченный heartbeat не скрывает незавершённый расчёт.
-        return [task for task in self._read()[0].values() if task.status not in TERMINAL_STATUSES]
+        """
+        Возвращает список активных задач из backend.
+        """
+        return self.backend.list_active()
 
     def _check_owner(self, task: TaskState) -> None:
+        """
+        Вызывает PermissionError, если задача принадлежит другому владельцу.
+        """
         if task.owner_id != self.owner_id:
             raise PermissionError(f"Процесс не владеет задачей {task.task_id}")
 
     def heartbeat(self, task_id: str) -> bool:
+        """
+        Подтверждает активность исполнителя, не оживляя просроченную задачу.
+
+        Возвращает True при обновлении времени активности, иначе False.
+        Для чужой задачи вызывает PermissionError, для отсутствующей — KeyError.
+        """
+
         def update(tasks):
             task = tasks[task_id]
             self._check_owner(task)
             self._expire_task(task)
-            if task.status in ACTIVE_STATUSES:
-                task.heartbeat_at = time.time()
-                return True
-            return False
+            if task.status not in ACTIVE_STATUSES:
+                return False
+            task.last_modified = time.time()
+            return True
 
-        return self._mutate(update)
+        return self.backend.mutate(update, task_id=task_id)
+
+    def set_total_rows(self, task_id: str, total_rows: int) -> bool:
+        """
+        Сохраняет результат проверки входа и время обновления исполнителем.
+
+        Возвращает True при обновлении задачи в RUNNING, иначе False.
+        Вызывает ValueError, если total_rows не является неотрицательным int,
+        PermissionError для чужой задачи и KeyError для отсутствующей.
+        """
+        if type(total_rows) is not int or total_rows < 0:
+            raise ValueError("total_rows: ожидается неотрицательное целое число")
+
+        def update(tasks):
+            task = tasks[task_id]
+            self._check_owner(task)
+            self._expire_task(task)
+            if task.status != TaskStatus.RUNNING:
+                return False
+            task.total_rows = total_rows
+            task.last_modified = time.time()
+            return True
+
+        return self.backend.mutate(update, task_id=task_id)
 
     def update_progress(
         self, task_id: str, processed_rows: int, inference_elapsed_sec: float
     ) -> None:
+        """
+        Обновляет число обработанных строк и время inference в секундах.
+
+        Сначала применяет таймаут; прогресс сохраняется только для активной задачи.
+        Для чужой задачи вызывает PermissionError, для отсутствующей — KeyError.
+        """
         def update(tasks):
             task = tasks[task_id]
             self._check_owner(task)
@@ -309,18 +285,29 @@ class TaskStore:
             if task.status in ACTIVE_STATUSES:
                 task.processed_rows = processed_rows
                 task.inference_elapsed_sec = inference_elapsed_sec
-                task.updated_at = task.heartbeat_at = time.time()
+                task.last_modified = time.time()
 
-        self._mutate(update)
+        self.backend.mutate(update, task_id=task_id)
 
     @staticmethod
     def _set_terminal(task: TaskState, status: TaskStatus, error: str | None = None) -> None:
+        """
+        Задаёт финальный статус, время завершения и ошибку, сбрасывает флаг отмены.
+        """
         task.status = status
-        task.updated_at = task.finished_at = time.time()
+        task.last_modified = task.finished_at = time.time()
         task.cancel_requested = False
         task.error = error
 
     def set_status(self, task_id: str, status: TaskStatus, error: str | None = None) -> bool:
+        """
+        Завершает задачу владельца с указанными финальным статусом и ошибкой.
+
+        Возвращает True, если итоговый статус совпадает с запрошенным; уже
+        завершённую задачу не изменяет. Для незавершённой задачи вызывает ValueError
+        при нефинальном статусе или переходе в DONE без FINALIZING.
+        Для чужой задачи вызывает PermissionError, для отсутствующей — KeyError.
+        """
         def update(tasks):
             task = tasks[task_id]
             self._check_owner(task)
@@ -334,15 +321,23 @@ class TaskStore:
             self._set_terminal(task, status, error)
             return True
 
-        return self._mutate(update)
+        return self.backend.mutate(update, task_id=task_id)
 
     def request_abort(self, task_id: str) -> TaskState | None:
+        """
+        Запрашивает отмену из API и возвращает задачу либо None, если её нет.
+
+        Задачу в QUEUED сразу переводит в ABORTED; для RUNNING и ABORTING
+        устанавливает флаг отмены и статус ABORTING без обновления heartbeat.
+        Для FINALIZING вызывает QueueConflictError, финальные статусы не меняет.
+        """
         def abort(tasks):
             task = tasks.get(task_id)
             if task is not None:
                 if task.status == TaskStatus.QUEUED:
                     self._set_terminal(task, TaskStatus.ABORTED)
                 elif task.status in (TaskStatus.RUNNING, TaskStatus.ABORTING):
+                    # Запрос API не подтверждает активность исполнителя.
                     task.cancel_requested = True
                     task.status = TaskStatus.ABORTING
                 elif task.status == TaskStatus.FINALIZING:
@@ -351,12 +346,18 @@ class TaskStore:
                     )
             return task
 
-        return self._mutate(abort)
+        return self.backend.mutate(abort, task_id=task_id)
 
     def cancellation_requested(self, task_id: str) -> bool:
+        """
+        Возвращает признак отмены активной задачи текущего владельца.
+
+        Вызывает RuntimeError, если задача отсутствует, завершена или просрочена,
+        и PermissionError, если она принадлежит другому владельцу.
+        """
         task = self.get(task_id)
         if task is None:
-            raise RuntimeError(f"Задача {task_id} отсутствует в очереди S3")
+            raise RuntimeError(f"Задача {task_id} отсутствует в очереди")
         self._check_owner(task)
         if task.status not in ACTIVE_STATUSES or self._timeout_reason(task):
             raise RuntimeError(f"task_not_active: задача {task_id} завершена или просрочена")
@@ -365,6 +366,13 @@ class TaskStore:
     def prepare_completion(
         self, task_id: str, processed_rows: int, inference_elapsed_sec: float
     ) -> bool:
+        """
+        Сохраняет итоговый прогресс и готовит задачу к публикации результата.
+
+        После проверки таймаута переводит незавершённую задачу в ABORTED при
+        запросе отмены, иначе в FINALIZING. Возвращает True только для FINALIZING.
+        Для чужой задачи вызывает PermissionError, для отсутствующей — KeyError.
+        """
         def prepare(tasks):
             task = tasks[task_id]
             self._check_owner(task)
@@ -372,27 +380,29 @@ class TaskStore:
             if task.status not in TERMINAL_STATUSES:
                 task.processed_rows = processed_rows
                 task.inference_elapsed_sec = inference_elapsed_sec
-                task.updated_at = task.heartbeat_at = time.time()
+                task.last_modified = time.time()
                 if task.cancel_requested:
                     self._set_terminal(task, TaskStatus.ABORTED)
                 else:
                     task.status = TaskStatus.FINALIZING
             return task.status == TaskStatus.FINALIZING
 
-        return self._mutate(prepare)
+        return self.backend.mutate(prepare, task_id=task_id)
 
     def _timeout_reason(self, task: TaskState) -> str | None:
+        """
+        Возвращает причину таймаута активной задачи или None без изменения состояния.
+        """
         if task.status not in ACTIVE_STATUSES:
             return None
-        now = time.time()
-        last_heartbeat = task.heartbeat_at if task.heartbeat_at is not None else task.updated_at
-        if now - last_heartbeat >= self.config.heartbeat_timeout_sec:
-            return "heartbeat_timeout: исполнитель не обновляет heartbeat"
-        if now - task.updated_at >= self.config.progress_timeout_sec:
-            return "progress_timeout: исполнитель не обновляет прогресс"
+        if time.time() - task.last_modified >= self.config.task_timeout_sec:
+            return "task_timeout: исполнитель не обновляет задачу"
         return None
 
     def _expire_task(self, task: TaskState) -> bool:
+        """
+        Переводит просроченную активную задачу в FAILED и возвращает признак изменения.
+        """
         reason = self._timeout_reason(task)
         if reason is None:
             return False
@@ -407,20 +417,33 @@ class TaskStore:
         def expire(tasks):
             return [task.task_id for task in tasks.values() if self._expire_task(task)]
 
-        for task_id in self._mutate(expire):
+        for task_id in self.backend.mutate(expire):
             self.logger.warn(f"Задача {task_id} переведена в FAILED по таймауту")
 
+    def check_queue(self) -> bool:
+        """
+        Readiness проверяет таймауты и запускает retention по расписанию без потока.
+
+        Одновременные запросы не накапливают проверки при медленном хранилище.
+        Возвращает True после обслуживания или False, если оно уже выполняется.
+        """
+        if not self._maintenance_lock.acquire(blocking=False):
+            return False
+        try:
+            self.fail_stale()
+            if time.monotonic() >= self._next_cleanup:
+                self.cleanup()
+                self._next_cleanup = time.monotonic() + self.config.cleanup_interval_sec
+            return True
+        finally:
+            self._maintenance_lock.release()
+
     def cleanup(self) -> None:
-        cutoff = time.time() - self.config.retention_months * 30 * 24 * 60 * 60
+        """
+        Запускает очистку backend по retention, если backend её поддерживает.
 
-        def clean(tasks):
-            expired = [
-                key
-                for key, task in tasks.items()
-                if task.status in TERMINAL_STATUSES
-                and (task.finished_at if task.finished_at is not None else task.updated_at) < cutoff
-            ]
-            for key in expired:
-                del tasks[key]
-
-        self._mutate(clean)
+        Порог хранения вычисляется из retention_months, считая месяц равным 30 дням.
+        """
+        if self.backend.supports_retention:
+            cutoff = time.time() - self.config.retention_months * 30 * 24 * 60 * 60
+            self.backend.cleanup(cutoff)

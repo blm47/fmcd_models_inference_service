@@ -1,20 +1,32 @@
 # Единственный источник настроек сервиса. Поля не переопределяются через ENV.
 models:
-  - name: "credit_cards"
+  - name: "fmcd_credit_cards"
     id_cols: ["customer_mdm_id", "partition_report_dt"]
     artifacts_dir: "artifacts/credit_cards"
-    weights_file: "model.pth"
-    schema_file: "schema.json"
-    calibrators_file: "calibrators.json"
-    freq_encoding_file: "freq_encoding.parquet"
+    backend: "fmcd_cc_dc"
+    device: "cuda"
+    infer_batch_size: 500
+    parquet_read_chunk_size: 5000
 
-inference:
-  device: "cuda"
-  infer_batch_size: 500
-  chunk_size: 5000
+  - name: "fmcd_debet_cards"
+    id_cols: ["customer_mdm_id", "partition_report_dt"]
+    artifacts_dir: "artifacts/debet_cards"
+    backend: "fmcd_cc_dc"
+    device: "cuda"
+    infer_batch_size: 500
+    parquet_read_chunk_size: 5000
 
-# Один объект в S3_BUCKET_OUT. Удаление объектов не используются.
+  - name: "fmcd_invest"
+    id_cols: ["customer_mdm_id", "partition_report_dt"]
+    artifacts_dir: "artifacts/fmcd_invest"
+    backend: "fmcd_invest"
+    device: "cuda"
+    infer_batch_size: 500
+    parquet_read_chunk_size: 5000
+
+# Хранилище очереди: s3 (файл) или pg (таблица).
 task_store:
+  backend: s3
   state_key: "_system/fmcd_models/task_state.json"
   cas_timeout_sec: 30
   cas_retry_interval_sec: 0.2
@@ -22,9 +34,8 @@ task_store:
   retention_months: 6
   max_pending_tasks: 1000
   heartbeat_interval_sec: 30
-  heartbeat_timeout_sec: 180
-  # Максимальное время без сохранённого прогресса, даже если heartbeat жив.
-  progress_timeout_sec: 1800
+  # Максимальное время без heartbeat или другого обновления исполнителем.
+  task_timeout_sec: 1800
   cleanup_interval_sec: 3600
   progress_update_interval_sec: 10
   connect_timeout_sec: 5

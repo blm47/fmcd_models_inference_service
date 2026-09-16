@@ -5,9 +5,9 @@
 Раскройте метод или DTO для просмотра. Примеры запросов нужно адаптировать
 к своим бакетам и модели. Отправка запросов доступна в `/docs` сервиса.
 
-Асинхронный GPU-инференс над parquet в S3. Любой под принимает заявки, свободный worker забирает их из общей очереди S3.
+Асинхронный GPU-инференс над parquet в S3. Любой под принимает заявки, свободный worker забирает их из общей очереди (S3 или PostgreSQL).
 
-**Airflow:** подготовить вход → `POST /infer` → опрашивать `GET /tasks/{task_id}/status` → при `DONE` забрать результат в Hadoop.
+**Airflow:** hadoop_2_S3 запускает Spark job → `POST /infer` → опрашивать `GET /tasks/{task_id}/status` → при `DONE` S3_2_Hadoop запускает Spark job. Parquet передаётся между хранилищами через Spark, не через Airflow.
 
 **Статусы:** `QUEUED → RUNNING → FINALIZING → DONE`. Ошибка или таймаут переводит задачу в `FAILED`. Отмена: `QUEUED → ABORTED` или `RUNNING → ABORTING → ABORTED`.
 
@@ -20,7 +20,9 @@
 
 Принимает заявку независимо от занятости GPU текущего пода.
 
-До постановки проверяет модель, входные parquet и выходной префикс.
+До постановки проверяет имя модели и параметры запроса без чтения данных S3.
+Worker проверяет входные parquet, колонки, число строк и содержимое выхода.
+Ошибка этих проверок завершает принятую задачу как FAILED.
 Входные данные должны оставаться неизменными до завершения расчёта.
 Выход не должен содержать parquet или `_SUCCESS` и пересекаться с входом,
 системным файлом либо выходом незавершённой задачи.
@@ -41,8 +43,9 @@
 
 ```json
 {
-  "idempotency_key": "credit_cards/run-1/infer/attempt-1",
-  "model_name": "credit_cards",
+  "calc_utilization": true,
+  "idempotency_key": "fmcd_credit_cards/run-1/infer/attempt-1",
+  "model_name": "fmcd_credit_cards",
   "s3_input_path": "s3://input-bucket/data/run-1",
   "s3_output_path": "s3://output-bucket/results/run-1"
 }
@@ -54,10 +57,10 @@
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 202 | Заявка сохранена или найдена ранее принятая попытка | application/json: [TaskAcceptedResponse](#taskacceptedresponse) |
-| 404 | Модель или входной префикс не найдены | application/json: [ErrorResponse](#errorresponse) |
+| 404 | Модель не найдена в конфигурации | application/json: [ErrorResponse](#errorresponse) |
 | 409 | Конфликт ключа, занятый выходной префикс или полная очередь | application/json: [ErrorResponse](#errorresponse) |
-| 422 | Некорректные параметры, колонки или непустой выход | application/json: [ErrorResponse](#errorresponse) |
-| 503 | S3 недоступен. Повторите запрос с прежним ключом | application/json: [ErrorResponse](#errorresponse) |
+| 422 | Некорректные параметры запроса или пути S3 | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Хранилище очереди недоступно. Повторите запрос с прежним ключом | application/json: [ErrorResponse](#errorresponse) |
 
 </details>
 
@@ -68,7 +71,7 @@
 
 Airflow опрашивает этот метод до DONE, FAILED или ABORTED.
 Результат готов к чтению только при DONE. ETA является оценкой, а не дедлайном.
-`executor_alive` вычисляется по heartbeat и не подтверждает физическую
+`executor_alive` вычисляется по last_modified и не подтверждает физическую
 остановку процесса при значении false.
 
 **Parameters**
@@ -82,7 +85,7 @@ Airflow опрашивает этот метод до DONE, FAILED или ABORTE
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 200 | Successful Response | application/json: [TaskStatusResponse](#taskstatusresponse) |
-| 503 | Не удалось прочитать или обновить очередь S3 | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Не удалось прочитать или обновить очередь | application/json: [ErrorResponse](#errorresponse) |
 | 404 | Задача не найдена или удалена из истории | application/json: [ErrorResponse](#errorresponse) |
 | 422 | Validation Error | application/json: [HTTPValidationError](#httpvalidationerror) |
 
@@ -108,7 +111,7 @@ Worker завершает текущую операцию и подтвержд�
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 200 | Successful Response | application/json: [TaskAbortResponse](#taskabortresponse) |
-| 503 | Не удалось прочитать или обновить очередь S3 | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Не удалось прочитать или обновить очередь | application/json: [ErrorResponse](#errorresponse) |
 | 404 | Задача не найдена | application/json: [ErrorResponse](#errorresponse) |
 | 409 | Задача FINALIZING уже публикует результат | application/json: [ErrorResponse](#errorresponse) |
 | 422 | Validation Error | application/json: [HTTPValidationError](#httpvalidationerror) |
@@ -118,7 +121,7 @@ Worker завершает текущую операцию и подтвержд�
 <details>
 <summary>GET /tasks/active — Получить все незавершённые задачи</summary>
 
-Все незавершённые задачи, включая очередь и потерявших heartbeat исполнителей.
+Все незавершённые задачи, включая очередь и переставших обновляться исполнителей.
 
 **Parameters**
 
@@ -129,14 +132,17 @@ Worker завершает текущую операцию и подтвержд�
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 200 | Successful Response | application/json: [ActiveTasksResponse](#activetasksresponse) |
-| 503 | Не удалось прочитать или обновить очередь S3 | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Не удалось прочитать или обновить очередь | application/json: [ErrorResponse](#errorresponse) |
 
 </details>
 
 <details>
-<summary>GET /healthz/liveness — Проверить работу потоков пода</summary>
+<summary>GET /healthz/liveness — Проверить работу процесса и consumer</summary>
 
-200 при работающих consumer и monitor, иначе 503. Доступ к S3 не проверяет.
+Проверяет локальный consumer и сигнал остановки без обращения к хранилищу.
+
+Занятый GPU не считается сбоем. Ошибка S3 или PG не вызывает рестарт контейнера
+через liveness. Метод не занимает поток, ожидающий I/O очереди.
 
 **Parameters**
 
@@ -152,9 +158,14 @@ Worker завершает текущую операцию и подтвержд�
 </details>
 
 <details>
-<summary>GET /healthz/readiness — Проверить готовность пода</summary>
+<summary>GET /healthz/readiness — Проверить готовность пода и таймауты задач</summary>
 
-200 при работающих consumer и monitor, иначе 503. Доступ к S3 не проверяет.
+Проверяет consumer, доступность очереди и переводит просроченные задачи в FAILED.
+
+Запускает retention S3 по cleanup_interval_sec; PG не очищается.
+Этот вызов заменяет поток monitor_queue: вне Kubernetes ручку нужно опрашивать.
+При сбое хранилища или уже выполняющейся проверке возвращает 503.
+Проверка выполняется и на поде с занятым GPU, heartbeat работает независимо.
 
 **Parameters**
 
@@ -170,9 +181,14 @@ Worker завершает текущую операцию и подтвержд�
 </details>
 
 <details>
-<summary>GET /health — Проверить состояние сервиса</summary>
+<summary>GET /health — Проверить готовность сервиса и очередь</summary>
 
-200 при работающих consumer и monitor, иначе 503. Доступ к S3 не проверяет.
+Проверяет consumer, доступность очереди и переводит просроченные задачи в FAILED.
+
+Запускает retention S3 по cleanup_interval_sec; PG не очищается.
+Этот вызов заменяет поток monitor_queue: вне Kubernetes ручку нужно опрашивать.
+При сбое хранилища или уже выполняющейся проверке возвращает 503.
+Проверка выполняется и на поде с занятым GPU, heartbeat работает независимо.
 
 **Parameters**
 
@@ -205,7 +221,7 @@ Worker завершает текущую операцию и подтвержд�
 | status | [TaskStatus](#taskstatus) | да | Один из незавершённых статусов | — |
 | progress_pct | number | да | Сохранённый прогресс в процентах | — |
 | eta_seconds | number &#124; null | да | Оценка оставшихся секунд, если доступна | — |
-| executor_alive | boolean | да | Признак актуального heartbeat исполнителя | — |
+| executor_alive | boolean | да | Признак актуального last_modified исполнителя | — |
 
 </details>
 
@@ -260,8 +276,9 @@ Worker завершает текущую операцию и подтвержд�
 
 | Поле | Тип | Обязательно | Описание | Ограничения и примеры |
 | --- | --- | --- | --- | --- |
-| idempotency_key | string | да | Стабильный ключ одной попытки расчёта Airflow | maxLength: 256; minLength: 1; examples: [&quot;credit_cards/run-1/infer/attempt-1&quot;] |
-| model_name | string | да | Имя модели из configs/models.yaml | minLength: 1; examples: [&quot;credit_cards&quot;] |
+| calc_utilization | boolean | нет | Считать утилизацию в памяти и вывести итог в logger; по умолчанию выключено | default: false; examples: [true] |
+| idempotency_key | string | да | Стабильный ключ одной попытки расчёта Airflow | maxLength: 256; minLength: 1; examples: [&quot;fmcd_credit_cards/run-1/infer/attempt-1&quot;] |
+| model_name | string | да | Имя модели из configs/models.yaml | minLength: 1; examples: [&quot;fmcd_credit_cards&quot;] |
 | s3_input_path | string | да | Входной префикс внутри S3_BUCKET_IN с подготовленными parquet | examples: [&quot;s3://input-bucket/data/run-1&quot;] |
 | s3_output_path | string | да | Выходной префикс внутри S3_BUCKET_OUT без parquet и _SUCCESS | examples: [&quot;s3://output-bucket/results/run-1&quot;] |
 
@@ -289,7 +306,7 @@ Worker завершает текущую операцию и подтвержд�
 | task_id | string | да | Идентификатор задачи для опроса статуса и отмены | — |
 | pod_id | string &#124; null | да | Под-исполнитель, null до назначения | — |
 | status | [TaskStatus](#taskstatus) | да | Текущий статус, у новой заявки QUEUED | — |
-| total_rows | integer | да | Количество строк во входных данных | — |
+| total_rows | integer &#124; null | да | Количество входных строк, null до проверки worker | — |
 
 </details>
 
@@ -315,12 +332,12 @@ Worker завершает текущую операцию и подтвержд�
 | pod_id | string &#124; null | да | Назначенный под, null до захвата задачи | — |
 | status | [TaskStatus](#taskstatus) | да | DONE, FAILED и ABORTED — финальные статусы | — |
 | processed_rows | integer | да | Количество обработанных строк по сохранённому прогрессу | — |
-| total_rows | integer | да | Количество входных строк | — |
+| total_rows | integer &#124; null | да | Количество входных строк, null до проверки worker | — |
 | progress_pct | number | да | Прогресс в процентах. 100 ещё не означает DONE | — |
 | eta_seconds | number &#124; null | да | Оценка оставшихся секунд, null если недоступна | — |
 | error | string &#124; null | да | Причина ошибки или таймаута, null при отсутствии | — |
-| heartbeat_at | number &#124; null | да | Последний heartbeat: Unix timestamp в секундах | — |
-| executor_alive | boolean | да | Признак актуального heartbeat, не проверка процесса | — |
+| last_modified | number | да | Последнее обновление задачи: Unix timestamp в секундах | — |
+| executor_alive | boolean | да | Признак актуального last_modified, не проверка процесса | — |
 | s3_output_path | string | да | Физический S3-префикс результата. Читать после DONE | — |
 | created_at | number | да | Создание задачи: Unix timestamp в секундах | — |
 | started_at | number &#124; null | да | Начало расчёта: Unix timestamp, null до старта | — |

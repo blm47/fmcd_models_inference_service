@@ -1,4 +1,6 @@
-"""Проверки совместимости с logger, у которого нет API стандартного logging."""
+"""
+Проверки совместимости с logger, у которого нет API стандартного logging.
+"""
 
 import sys
 import threading
@@ -9,7 +11,8 @@ from unittest.mock import Mock, patch
 from logger_stub import make_logger
 
 from app.core.logging import setup_logging
-from app.tasks.worker import _keep_heartbeat
+from app.tasks.state import TaskStatus
+from app.tasks.worker import _save_status
 
 
 class LoggingTests(unittest.TestCase):
@@ -26,10 +29,10 @@ class LoggingTests(unittest.TestCase):
     def test_error_receives_one_string_with_traceback(self):
         logger = make_logger()
         stop = Mock(spec=threading.Event)
-        stop.wait.side_effect = [False, True]
+        stop.wait.return_value = True
         store = Mock()
-        store.heartbeat.side_effect = RuntimeError("Ошибка подключения S3")
-        _keep_heartbeat("task-1", store, stop, logger)
+        store.set_status.side_effect = RuntimeError("Ошибка подключения S3")
+        _save_status(store, "task-1", TaskStatus.FAILED, "error", stop, logger)
         logger.error.assert_called_once()
         args, kwargs = logger.error.call_args
         self.assertEqual(len(args), 1)

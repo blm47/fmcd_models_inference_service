@@ -1,4 +1,6 @@
-"""Контракт оператора с сервисом без установки Airflow и его metadata DB."""
+"""
+Контракт оператора с сервисом без установки Airflow и его metadata DB.
+"""
 
 import importlib.util
 import io
@@ -44,7 +46,9 @@ class BaseSensorOperator:
 
 
 def load_operator():
-    """Изолированный импорт: заглушка не подменяет Airflow у остальных тестов."""
+    """
+    Изолированный импорт: заглушка не подменяет Airflow у остальных тестов.
+    """
     modules = {
         name: types.ModuleType(name)
         for name in ("airflow", "airflow.exceptions", "airflow.sensors", "airflow.sensors.base")
@@ -70,8 +74,41 @@ Operator = load_operator()
 
 
 class InferenceOperatorTests(unittest.TestCase):
+    def test_utilization_flag_is_sent_for_every_shard(self):
+        self.assertFalse(
+            self.operator(shard_id_column=None)._requests(self.context)[0]["calc_utilization"]
+        )
+        operator = self.operator(calc_utilization=True, shard_id_column="shard_id", num_shards=3)
+        requests = operator._requests(self.context)
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(payload["calc_utilization"] is True for payload in requests))
+        with self.assertRaisesRegex(ValueError, "calc_utilization"):
+            self.operator(calc_utilization="False")
+
+    def test_default_shard_column_is_used_when_count_is_provided(self):
+        operator = self.operator(num_shards=2)
+        self.assertEqual(operator.shard_id_column, "shard_id")
+        requests = operator._requests(self.context)
+        self.assertEqual(
+            [payload["s3_input_path"] for payload in requests],
+            [f"s3://input/data/shard_id={index}" for index in range(2)],
+        )
+        self.assertEqual(
+            [payload["s3_output_path"] for payload in requests],
+            [f"s3://output/data/shard_id={index}" for index in range(2)],
+        )
+        self.assertNotEqual(requests[0]["idempotency_key"], requests[1]["idempotency_key"])
+
+    def test_explicitly_disabled_sharding_submits_one_request(self):
+        operator = self.operator(shard_id_column=None)
+        with self.assertRaises(AirflowRescheduleException):
+            operator.execute(self.context)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0]["s3_input_path"], "s3://input/data")
+        self.assertEqual(self.requests[0]["s3_output_path"], "s3://output/data")
+
     def test_progress_is_logged_on_every_poll_and_100_is_not_done(self):
-        operator = self.operator()
+        operator = self.operator(shard_id_column=None)
         payload = operator._requests(self.context)[0]
         key = payload["idempotency_key"]
         self.tasks[key] = {
@@ -95,7 +132,7 @@ class InferenceOperatorTests(unittest.TestCase):
         self.assertIn("ETA=0 с", operator.log.info.call_args.args[0])
 
     def test_unavailable_eta_and_zero_progress_are_logged(self):
-        operator = self.operator()
+        operator = self.operator(shard_id_column=None)
         key = operator._requests(self.context)[0]["idempotency_key"]
         self.tasks[key] = {
             "task_id": key,
@@ -126,7 +163,7 @@ class InferenceOperatorTests(unittest.TestCase):
                         urlopen=lambda *a, verify=verify, **kw: self.tls_response(kw, verify),
                     ):
                         Operator._http(operator, method, path)
-        self.assertTrue(self.operator().verify_ssl)
+        self.assertFalse(self.operator().verify_ssl)
         with self.assertRaises(ValueError):
             self.operator(verify_ssl="False")
 
@@ -173,7 +210,7 @@ class InferenceOperatorTests(unittest.TestCase):
     def test_reschedule_restores_same_tasks_without_xcom(self):
         for _ in range(2):
             with self.assertRaises(AirflowRescheduleException):
-                self.operator(partition_by="shard_id", n_shards=3).execute(self.context)
+                self.operator(shard_id_column="shard_id", num_shards=3).execute(self.context)
         self.assertEqual(len(self.tasks), 3)
         self.assertEqual(self.aborted, [])
         self.assertEqual(
@@ -186,7 +223,7 @@ class InferenceOperatorTests(unittest.TestCase):
         )
 
     def test_success_requires_all_done_and_returns_ids(self):
-        operator = self.operator(partition_by="shard", n_shards=2)
+        operator = self.operator(shard_id_column="shard", num_shards=2)
         with self.assertRaises(AirflowRescheduleException):
             operator.execute(self.context)
         tasks = list(self.tasks.values())
@@ -199,24 +236,24 @@ class InferenceOperatorTests(unittest.TestCase):
         self.assertEqual(result["s3_output_prefix"], "s3://output/data")
 
     def test_failure_aborts_every_other_active_shard(self):
-        operator = self.operator(partition_by="shard", n_shards=3)
+        operator = self.operator(shard_id_column="shard", num_shards=3)
         with self.assertRaises(AirflowRescheduleException):
             operator.execute(self.context)
         tasks = list(self.tasks.values())
         tasks[0].update(status="FAILED", error="GPU error")
         with self.assertRaisesRegex(AirflowException, "GPU error"):
-            self.operator(partition_by="shard", n_shards=3).execute(self.context)
+            self.operator(shard_id_column="shard", num_shards=3).execute(self.context)
         self.assertEqual(set(self.aborted), {task["task_id"] for task in tasks[1:]})
 
     def test_manual_new_attempt_uses_new_keys(self):
-        first = self.operator()._requests(self.context)
+        first = self.operator(shard_id_column=None)._requests(self.context)
         self.context["ti"].try_number += 1
-        second = self.operator()._requests(self.context)
+        second = self.operator(shard_id_column=None)._requests(self.context)
         self.assertNotEqual(first[0]["idempotency_key"], second[0]["idempotency_key"])
         self.assertEqual(first[0]["s3_output_path"], "s3://output/data")
 
     def test_partial_submission_failure_still_cancels_other_shards(self):
-        operator = self.operator(partition_by="shard", n_shards=3)
+        operator = self.operator(shard_id_column="shard", num_shards=3)
 
         def http(method, path, payload=None):
             if payload and payload["s3_input_path"].endswith("=1"):
@@ -246,10 +283,13 @@ class InferenceOperatorTests(unittest.TestCase):
 
     def test_invalid_shard_configuration(self):
         for kwargs in (
-            {"partition_by": "shard"},
-            {"n_shards": 3},
-            {"partition_by": "shard", "n_shards": 0},
-            {"partition_by": "shard", "n_shards": 1.5},
+            {"shard_id_column": "shard"},
+            {"shard_id_column": None, "num_shards": 3},
+            {"shard_id_column": "shard", "num_shards": 0},
+            {"shard_id_column": "shard", "num_shards": 1.5},
+            {"shard_id_column": "shard", "num_shards": True},
+            {"shard_id_column": "invalid/name", "num_shards": 3},
+            {"shard_id_column": "", "num_shards": 3},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.operator(**kwargs)._requests(self.context)
@@ -272,7 +312,7 @@ class InferenceOperatorTests(unittest.TestCase):
                 http.assert_called_once_with("POST", "/tasks/task-1/abort")
 
     def test_lost_http_response_retries_same_payload(self):
-        operator = self.operator()
+        operator = self.operator(shard_id_column=None)
         payload = operator._requests(self.context)[0]
         globals_ = Operator._http.__globals__
         from unittest.mock import Mock

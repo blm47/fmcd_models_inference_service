@@ -50,6 +50,9 @@ RUN pip install confluent_kafka==2.8.0
 RUN pip install autodynatrace==2.1.1
 RUN pip install dadm-functions==0.5.5
 RUN pip install psutil==5.9.8
+RUN pip install "nvidia-ml-py>=12.0"
+RUN pip install "psycopg[binary]>=3.2,<4"
+RUN pip install "psycopg-pool>=3.2,<4"
 
 EXPOSE 8080
 

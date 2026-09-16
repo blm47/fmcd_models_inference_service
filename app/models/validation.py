@@ -1,15 +1,13 @@
 """
-Валидация входного parquet перед постановкой задачи в фон.
+Валидация входного parquet в worker после захвата задачи.
 
-ручка /infer должна проверить, что во
-входном parquet присутствуют все фичи, необходимые
-моделям, и уйти в фон только после успешной проверки. Технические колонки
+Worker проверяет, что входной parquet содержит все фичи модели. Технические колонки
 (ID_COL, DATE_COL) также обязательны, т.к. без них нельзя собрать результат.
 """
 
 from dataclasses import dataclass
 
-from app.models.registry import ModelBundle
+from app.models.contracts import ModelBundle
 from app.storage.s3_client import S3Client
 
 
@@ -34,7 +32,7 @@ def validate_input_parquet(
 
     available_columns = s3_client.get_schema_columns(s3_input_prefix)
 
-    required_columns = set(bundle.num_cols) | set(bundle.cat_cols) | set(bundle.id_cols)
+    required_columns = set(bundle.required_columns) | set(bundle.spec.id_cols)
     missing = sorted(required_columns - available_columns)
 
     total_rows = s3_client.count_rows(s3_input_prefix) if not missing else 0

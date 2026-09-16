@@ -18,8 +18,8 @@ class GPUModelInferenceOperator(BaseSensorOperator):
     """
     Отправляет запросы в сервис и освобождает worker между проверками.
 
-    Без partition_by и n_shards создаёт один расчёт. С ними использует пути
-    prefix/partition_by=0 ... prefix/partition_by=n_shards-1 на входе и выходе.
+    Без shard_id_column и num_shards создаёт один расчёт. С ними использует пути
+    prefix/shard_id_column=0 ... prefix/shard_id_column=num_shards-1 на входе и выходе.
     Успех — только DONE у всех шардов. Ошибка запуска, FAILED или ABORTED
     завершает задачу Airflow с ошибкой и запрашивает отмену остальных расчётов.
 
@@ -34,8 +34,9 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         "s3_input_prefix",
         "s3_output_prefix",
         "model_name",
-        "partition_by",
-        "n_shards",
+        "shard_id_column",
+        "num_shards",
+        "calc_utilization",
     )
     ui_color = "#d8ebfa"
 
@@ -46,17 +47,38 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         s3_input_prefix: str,
         s3_output_prefix: str,
         model_name: str,
-        partition_by: str | None = None,
-        n_shards: int | None = None,
+        shard_id_column: str | None = "shard_id",
+        num_shards: int | None = None,
         poke_interval: float = 60,
         timeout: float = 86400,
         request_timeout: float = 30,
-        verify_ssl: bool = True,
+        verify_ssl: bool = False,
+        calc_utilization: bool = False,
         **kwargs,
     ):
         """
-        :param verify_ssl: Проверять сертификат и имя HTTPS-сервиса, по умолчанию True.
+        :param service_url: Базовый URL сервиса инференса с http:// или https://.
+        :param s3_input_prefix: Префикс входных данных вида s3://bucket/path.
+        :param s3_output_prefix: Префикс результатов вида s3://bucket/path.
+        :param model_name: Непустое имя модели для запуска инференса.
+        :param shard_id_column: Имя колонки идентификатора шарда; задаётся вместе с num_shards.
+            По умолчанию "shard_id": запускается один расчёт без разбиения на шарды.
+        :param num_shards: Положительное целое число шардов; задаётся вместе с shard_id_column.
+            К входному и выходному префиксам добавляется /shard_id_column=i,
+            где i от 0 до num_shards - 1. По умолчанию None.
+        :param poke_interval: Интервал между проверками статуса в секундах,
+            по умолчанию 60.
+        :param timeout: Общий таймаут ожидания завершения в секундах, включая время
+            между reschedule, по умолчанию 86400.
+        :param request_timeout: Положительный таймаут отдельного HTTP-запроса
+            в секундах, по умолчанию 30.
+        :param verify_ssl: Проверять сертификат и имя HTTPS-сервиса, по умолчанию False.
             False отключает проверку для запуска, опроса и отмены инференса.
+        :param calc_utilization: Считать утилизацию в памяти worker и вывести итог
+            в logger, по умолчанию False.
+        :param kwargs: Дополнительные параметры BaseSensorOperator, включая task_id.
+            retries должен быть 0, mode — 'reschedule'; эти значения заданы
+            по умолчанию. soft_fail и silent_fail не должны быть включены.
         """
         # Не наследуем автоматические retries из default_args DAG.
         kwargs.setdefault("retries", 0)
@@ -69,6 +91,8 @@ class GPUModelInferenceOperator(BaseSensorOperator):
             )
         if request_timeout <= 0:
             raise ValueError("request_timeout должен быть положительным")
+        if not isinstance(calc_utilization, bool):
+            raise ValueError("calc_utilization должен быть bool")
         if not isinstance(verify_ssl, bool):
             raise ValueError("verify_ssl должен быть bool")
         super().__init__(poke_interval=poke_interval, timeout=timeout, **kwargs)
@@ -76,10 +100,11 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         self.s3_input_prefix = s3_input_prefix
         self.s3_output_prefix = s3_output_prefix
         self.model_name = model_name
-        self.partition_by = partition_by
-        self.n_shards = n_shards
+        self.shard_id_column = shard_id_column
+        self.num_shards = num_shards
         self.request_timeout = request_timeout
         self.verify_ssl = verify_ssl
+        self.calc_utilization = calc_utilization
         self._tasks = {}
 
     def _requests(self, context):
@@ -92,16 +117,16 @@ class GPUModelInferenceOperator(BaseSensorOperator):
             parsed = urlsplit(prefix)
             if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
                 raise ValueError("Нужен непустой S3-префикс вида s3://bucket/path")
-        if (self.partition_by is None) != (self.n_shards is None):
-            raise ValueError("partition_by и n_shards нужно передать вместе")
+        if (self.shard_id_column is None) != (self.num_shards is None):
+            raise ValueError("shard_id_column и num_shards нужно передать вместе")
         suffixes = [""]
-        if self.partition_by is not None:
-            if not self.partition_by or any(c in self.partition_by for c in "/=?#"):
-                raise ValueError("partition_by должен содержать имя колонки")
-            count = int(self.n_shards)
-            if isinstance(self.n_shards, bool) or str(count) != str(self.n_shards) or count < 1:
-                raise ValueError("n_shards должен быть положительным целым числом")
-            suffixes = [f"/{self.partition_by}={i}" for i in range(count)]
+        if self.shard_id_column is not None:
+            if not self.shard_id_column or any(c in self.shard_id_column for c in "/=?#"):
+                raise ValueError("shard_id_column должен содержать имя колонки")
+            count = int(self.num_shards)
+            if isinstance(self.num_shards, bool) or str(count) != str(self.num_shards) or count < 1:
+                raise ValueError("num_shards должен быть положительным целым числом")
+            suffixes = [f"/{self.shard_id_column}={i}" for i in range(count)]
         ti = context["ti"]
         requests = []
         for suffix in suffixes:
@@ -112,6 +137,7 @@ class GPUModelInferenceOperator(BaseSensorOperator):
                 {
                     "idempotency_key": str(uuid.uuid5(uuid.NAMESPACE_URL, identity)),
                     "model_name": self.model_name,
+                    "calc_utilization": self.calc_utilization,
                     "s3_input_path": self.s3_input_prefix.rstrip("/") + suffix,
                     "s3_output_path": self.s3_output_prefix.rstrip("/") + suffix,
                 }

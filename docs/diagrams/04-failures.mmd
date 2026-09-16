@@ -2,9 +2,9 @@ sequenceDiagram
     autonumber
     participant A as Airflow
     participant API as API сервиса
-    participant Q as Общая очередь S3
+    participant Q as Общая очередь TaskStore
     participant W as GPU-под
-    participant M as Монитор
+    participant M as Readiness по запросу Kubelet
     participant S as S3 — выходные данные
 
     Note over Q,W: Задача выполняется: RUNNING
@@ -12,7 +12,7 @@ sequenceDiagram
         W->>W: Завершить текущую операцию и остановить расчёт
         W->>Q: FAILED — сохранить причину ошибки
     else Исполнитель пропал или прогресс остановился
-        M->>Q: Проверить heartbeat и время обновления прогресса
+        M->>Q: Проверить last_modified
         M->>Q: При превышении таймаута сохранить FAILED
     else Запрошена отмена
         A->>API: POST /tasks/task_id/abort

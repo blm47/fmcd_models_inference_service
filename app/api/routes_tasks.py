@@ -1,8 +1,8 @@
 """
 GET /tasks/{task_id}/status и POST /tasks/{task_id}/abort.
 
-Статусы и запросы отмены разделяются между подами через S3. История
-хранится до retention_months; незавершённые задачи не удаляются.
+Статусы и запросы отмены разделяются между подами через backend TaskStore. История
+в S3 хранится до retention_months, в PG не очищается сервисом.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,7 +21,7 @@ router = APIRouter(
     prefix="/tasks",
     tags=["tasks"],
     responses={
-        503: {"model": ErrorResponse, "description": "Не удалось прочитать или обновить очередь S3"}
+        503: {"model": ErrorResponse, "description": "Не удалось прочитать или обновить очередь"}
     },
 )
 
@@ -43,7 +43,7 @@ def get_task_status(
 
     Airflow опрашивает этот метод до DONE, FAILED или ABORTED.
     Результат готов к чтению только при DONE. ETA является оценкой, а не дедлайном.
-    `executor_alive` вычисляется по heartbeat и не подтверждает физическую
+    `executor_alive` вычисляется по last_modified и не подтверждает физическую
     остановку процесса при значении false.
     """
     task = task_store.get(task_id)
@@ -60,7 +60,7 @@ def get_task_status(
         progress_pct=task.progress_pct,
         eta_seconds=task.eta_seconds,
         error=task.error,
-        heartbeat_at=task.heartbeat_at,
+        last_modified=task.last_modified,
         executor_alive=task_store.executor_alive(task),
         s3_output_path=task.s3_output_path,
         created_at=task.created_at,
@@ -98,7 +98,7 @@ def abort_task(task_id: str, task_store: TaskStore = Depends(get_task_store)):
 )
 def get_active_tasks(task_store: TaskStore = Depends(get_task_store)):
     """
-    Все незавершённые задачи, включая очередь и потерявших heartbeat исполнителей.
+    Все незавершённые задачи, включая очередь и переставших обновляться исполнителей.
     """
     active_tasks = task_store.get_all_active()
     return ActiveTasksResponse(

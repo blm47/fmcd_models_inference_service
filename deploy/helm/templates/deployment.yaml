@@ -57,18 +57,41 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.s3.existingSecretName }}
                   key: secret-key
+            {{- $config := fromYaml (required "Передайте serviceConfig" .Values.serviceConfig) }}
+            {{- if eq $config.task_store.backend "pg" }}
+            - name: POSTGRES_URL
+              value: {{ required "Передайте postgres.url" .Values.postgres.url | quote }}
+            - name: POSTGRES_SCHEMA
+              value: {{ required "Передайте postgres.schema" .Values.postgres.schema | quote }}
+            - name: POSTGRES_TABLE_NAME
+              value: {{ required "Передайте postgres.tableName" .Values.postgres.tableName | quote }}
+            - name: POSTGRES_SSLMODE
+              value: {{ .Values.postgres.sslmode | quote }}
+            - name: POSTGRES_LOGIN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "Передайте postgres.existingSecretName" .Values.postgres.existingSecretName }}
+                  key: login
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecretName }}
+                  key: password
+            {{- end }}
           livenessProbe:
             httpGet:
-              path: /health
+              path: /healthz/liveness
               port: {{ .Values.service.port }}
             initialDelaySeconds: 60
             periodSeconds: 30
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
-              path: /health
+              path: /healthz/readiness
               port: {{ .Values.service.port }}
             initialDelaySeconds: 30
             periodSeconds: 15
+            timeoutSeconds: {{ .Values.probes.readinessTimeoutSeconds }}
       volumes:
         - name: config
           configMap:

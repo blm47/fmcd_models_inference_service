@@ -8,18 +8,23 @@ from app.tasks.state import TaskStatus
 
 
 class InferRequest(BaseModel):
+    calc_utilization: bool = Field(
+        False,
+        description="Считать утилизацию в памяти и вывести итог в logger; по умолчанию выключено",
+        examples=[True],
+    )
     idempotency_key: str = Field(
         ...,
         min_length=1,
         max_length=256,
         description="Стабильный ключ одной попытки расчёта Airflow",
-        examples=["credit_cards/run-1/infer/attempt-1"],
+        examples=["fmcd_credit_cards/run-1/infer/attempt-1"],
     )
     model_name: str = Field(
         ...,
         min_length=1,
         description="Имя модели из configs/models.yaml",
-        examples=["credit_cards"],
+        examples=["fmcd_credit_cards"],
     )
     s3_input_path: str = Field(
         description="Входной префикс внутри S3_BUCKET_IN с подготовленными parquet",
@@ -35,7 +40,7 @@ class TaskAcceptedResponse(BaseModel):
     task_id: str = Field(description="Идентификатор задачи для опроса статуса и отмены")
     pod_id: str | None = Field(description="Под-исполнитель, null до назначения")
     status: TaskStatus = Field(description="Текущий статус, у новой заявки QUEUED")
-    total_rows: int = Field(description="Количество строк во входных данных")
+    total_rows: int | None = Field(description="Количество входных строк, null до проверки worker")
 
 
 class TaskStatusResponse(BaseModel):
@@ -46,12 +51,16 @@ class TaskStatusResponse(BaseModel):
     processed_rows: int = Field(
         description="Количество обработанных строк по сохранённому прогрессу"
     )
-    total_rows: int = Field(description="Количество входных строк")
+    total_rows: int | None = Field(description="Количество входных строк, null до проверки worker")
     progress_pct: float = Field(description="Прогресс в процентах. 100 ещё не означает DONE")
     eta_seconds: float | None = Field(description="Оценка оставшихся секунд, null если недоступна")
     error: str | None = Field(description="Причина ошибки или таймаута, null при отсутствии")
-    heartbeat_at: float | None = Field(description="Последний heartbeat: Unix timestamp в секундах")
-    executor_alive: bool = Field(description="Признак актуального heartbeat, не проверка процесса")
+    last_modified: float = Field(
+        description="Последнее обновление задачи: Unix timestamp в секундах"
+    )
+    executor_alive: bool = Field(
+        description="Признак актуального last_modified, не проверка процесса"
+    )
     s3_output_path: str = Field(description="Физический S3-префикс результата. Читать после DONE")
     created_at: float = Field(description="Создание задачи: Unix timestamp в секундах")
     started_at: float | None = Field(description="Начало расчёта: Unix timestamp, null до старта")
@@ -70,7 +79,7 @@ class ActiveTaskSummary(BaseModel):
     status: TaskStatus = Field(description="Один из незавершённых статусов")
     progress_pct: float = Field(description="Сохранённый прогресс в процентах")
     eta_seconds: float | None = Field(description="Оценка оставшихся секунд, если доступна")
-    executor_alive: bool = Field(description="Признак актуального heartbeat исполнителя")
+    executor_alive: bool = Field(description="Признак актуального last_modified исполнителя")
 
 
 class ActiveTasksResponse(BaseModel):

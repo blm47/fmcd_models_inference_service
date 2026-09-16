@@ -1,4 +1,6 @@
-"""Контракт Airflow проверяется без загрузки моделей и GPU."""
+"""
+Контракт Airflow проверяется без загрузки моделей и GPU.
+"""
 
 import sys
 import types
@@ -10,10 +12,25 @@ from fastapi.testclient import TestClient
 from logger_stub import make_logger
 
 from app.main import app
+from app.tasks.backends.base import TaskStorageError
 from app.tasks.state import TaskStatus
 
 
 class ApiTests(unittest.TestCase):
+    def test_utilization_is_disabled_by_default(self):
+        task_id = self.submit().json()["task_id"]
+        self.assertFalse(self.store.get(task_id).calc_utilization)
+        result = self.client.get(f"/tasks/{task_id}/status").json()
+        self.assertFalse(any(key.startswith("metrics_util_") for key in result))
+
+    def test_utilization_flag_is_persisted_and_part_of_idempotency(self):
+        response = self.submit(calc_utilization=True)
+        self.assertEqual(response.status_code, 202)
+        task_id = response.json()["task_id"]
+        self.assertTrue(self.store.get(task_id).calc_utilization)
+        self.assertEqual(self.submit(calc_utilization=True).json()["task_id"], task_id)
+        self.assertEqual(self.submit(calc_utilization=False).status_code, 409)
+
     def setUp(self):
         self.store = make_store(FakeS3())
         self.store.initialize()
@@ -63,7 +80,7 @@ class ApiTests(unittest.TestCase):
         second = self.submit()
         self.assertEqual(second.status_code, 202)
         self.assertEqual(second.json()["task_id"], first["task_id"])
-        self.assertEqual(self.validation.call_count, 1)
+        self.validation.assert_not_called()
 
     def test_new_attempt_after_failure_gets_new_id(self):
         first = self.submit().json()
@@ -75,7 +92,7 @@ class ApiTests(unittest.TestCase):
 
     def test_status_and_abort_from_other_pod(self):
         task_id = self.submit().json()["task_id"]
-        app.state.task_store = make_store(self.store.client)
+        app.state.task_store = make_store(self.store.backend.client)
         response = self.client.get(f"/tasks/{task_id}/status")
         self.assertEqual(response.json()["status"], "QUEUED")
         self.assertIsNone(response.json()["started_at"])
@@ -90,8 +107,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.submit(idempotency_key="other").status_code, 409)
 
     def test_storage_failure_does_not_confirm_acceptance(self):
-        self.store.client.fail_next = 403
+        self.store.backend.client.fail_next = 403
         self.assertEqual(self.submit().status_code, 503)
+
+    def test_postgres_storage_error_returns_503(self):
+        with patch.object(
+            self.store.backend, "get_by_key", side_effect=TaskStorageError("PG unavailable")
+        ):
+            response = self.submit()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("идемпотентности", response.json()["detail"])
+
+    def test_status_exposes_last_modified_without_heartbeat(self):
+        task_id = self.submit().json()["task_id"]
+        response = self.client.get(f"/tasks/{task_id}/status").json()
+        self.assertEqual(response["last_modified"], self.store.get(task_id).last_modified)
+        self.assertNotIn("heartbeat_at", response)
 
     def test_protects_queue_and_bucket_root(self):
         for path in (
@@ -103,9 +134,14 @@ class ApiTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.submit(s3_output_path=path).status_code, 422)
 
-    def test_output_success_marker_rejects_new_attempt(self):
+    def test_request_does_not_read_inputs_or_output(self):
         app.state.s3_client.prefix_has_results.return_value = True
-        self.assertEqual(self.submit().status_code, 422)
+        self.validation.side_effect = FileNotFoundError("нет входа")
+        response = self.submit()
+        self.assertEqual(response.status_code, 202)
+        self.assertIsNone(response.json()["total_rows"])
+        self.validation.assert_not_called()
+        self.assertEqual(app.state.s3_client.mock_calls, [])
 
     def test_idempotency_key_required(self):
         del self.request["idempotency_key"]
