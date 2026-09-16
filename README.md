@@ -9,13 +9,6 @@ FastAPI-сервис выполняет GPU-инференс над parquet из
 
 ## Документация API (Swagger)
 
-Для просмотра в веб-интерфейсе репозитория откройте **[снимок API](docs/swagger.md)**.
-Это лёгкий Markdown в структуре Swagger: раскрывающиеся методы, Parameters,
-Request body, Responses и DTO в разделе Schemas. GitHub/GitLab отображают
-его стандартным просмотрщиком Markdown без JavaScript и дополнительных ресурсов.
-Внешний вид определяется просмотрщиком Git; отправка запросов доступна только
-в серверном Swagger UI. UML-диаграмм в снимке нет.
-
 После запуска сервиса доступны:
 
 - `/docs` — Swagger UI с описаниями методов, параметров, статусов и ошибок.
@@ -23,7 +16,7 @@ Request body, Responses и DTO в разделе Schemas. GitHub/GitLab отоб
 - `/openapi.json` — автоматически сформированная схема OpenAPI для экспорта
   и генерации клиентов.
 
-При локальном запуске откройте `http://localhost:8000/docs`.
+При локальном запуске откройте `http://localhost:8080/docs`.
 В Kubernetes используйте тот же адрес сервиса, что и для `/infer`, добавив `/docs`.
 Кнопка **Try it out** отправляет настоящий запрос: `POST /infer` создаёт задачу,
 а `POST /tasks/{task_id}/abort` запрашивает отмену.
@@ -35,29 +28,18 @@ FastAPI строит схему из зарегистрированных мар
 Текстовые пояснения поведения нужно актуализировать вместе с реализацией.
 Отдельную копию OpenAPI вручную поддерживать не нужно.
 
-После изменения маршрутов или схем обновите снимок:
-
-```bash
-python scripts/export_openapi.py
-```
-
-Команда обновляет только `docs/swagger.md`.
-Экспорт не запускает GPU worker и не подключается к S3. Python-зависимости API
-нужны только для генерации. Скачивание ресурсов для генерации не требуется.
-Тест проверяет актуальность Markdown-снимка и завершается ошибкой,
-если после изменения API документацию забыли обновить.
-
-Серверные страницы Swagger UI и ReDoc загружают JS/CSS из CDN: браузеру
-нужен доступ к ним. Markdown-снимок и `/openapi.json` внешних ресурсов не требуют.
+Swagger UI и ReDoc доступны на работающем сервисе. Статический Markdown-снимок
+не хранится; актуальная схема доступна через `/openapi.json`.
+Swagger UI и ReDoc загружают JS/CSS из CDN, `/openapi.json` этого не требует.
 
 ## Вызов из Airflow
 
 [HadoopToS3Operator](docs/hadoop-to-s3-operator.md) запускает Spark job для подготовки данных,
 опциональную выгрузку метаданных и подсчёт parquet текущей загрузки.
 
-Готовый [ModelInferenceOperator для Airflow 2.6.3](docs/airflow-operator.md)
+Готовый [GPUModelInferenceOperator для Airflow 2.6.3](docs/airflow-operator.md)
 отправляет заявки без авторизации через `service_url` и ждёт в режиме `reschedule`.
-Поддерживает один префикс или шарды `partition_by=0..n_shards-1`.
+Поддерживает один префикс или шарды `shard_id_column=0..num_shards-1`.
 
 1. Оператор hadoop_2_S3 в Airflow запускает через spark-submit подготовку входного префикса: `_SUCCESS` и `part-*.parquet`.
    Во время ожидания в очереди и расчёта входные данные должны оставаться неизменными.
@@ -188,7 +170,7 @@ S3 хранит один JSON; PostgreSQL хранит каждую задачу
 
 Счётчик `revision` увеличивается при каждой записи, поэтому очистка не
 возвращает содержимое к прежней версии. Захват фиксирует `RUNNING`, под и
-уникальный идентификатор процесса. Владелец меняет прогресс и итог своего расчёта; монитор может
+уникальный идентификатор процесса. Владелец меняет прогресс и итог своего расчёта; readiness может
 завершить просроченную задачу как FAILED. Потерянный ответ на захват восстанавливается чтением владельца.
 Один consumer на под последовательно запускает worker; старейшая доступная
 задача выбирается по `created_at` и `task_id`.
@@ -204,7 +186,7 @@ S3 хранит один JSON; PostgreSQL хранит каждую задачу
 повреждённая структура не приводят к перезаписи очереди. Отсутствие объекта
 во время работы тоже не трактуется как пустая очередь.
 
-Монитор очищает историю завершённых задач раз в `cleanup_interval_sec`,
+Readiness очищает историю завершённых задач раз в `cleanup_interval_sec`,
 в том числе во время инференса. Записи старше `retention_months` удаляются из JSON
 через CAS; месяц равен 30 суткам. Ожидающие и незавершённые задачи не удаляются.
 Предел `max_pending_tasks` относится ко всем незавершённым задачам.
@@ -360,16 +342,16 @@ Backend реализует pipeline, а модель задаёт его нас�
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+python main.py
 ```
 
 Для тестов очереди, конфигурации, API и worker без GPU:
 
 ```bash
-pip install boto3 pyyaml fastapi httpx ruff s3fs pandas pyarrow
+pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
-ruff check app tests main.py
-ruff format --check app tests main.py
+ruff check app airflow_operators scripts tests main.py
+ruff format --check app airflow_operators scripts tests main.py
 ```
 
 Тесты используют S3 с атомарным CAS в памяти и моделируют конкурентные поды,
@@ -400,3 +382,15 @@ RAM/GPU_RAM в % и МБ. По умолчанию сбор выключен. С�
 В TaskStore и ответе статуса статистики нет. В Airflow используется
 `GPUModelInferenceOperator(calc_utilization=True, ...)`.
 [Единицы и область измерения](docs/task-utilization.md).
+
+## Рабочий образ и зависимости
+
+Рабочий образ собирается корневым `Dockerfile`; он задаёт версии зависимостей.
+`requirements.txt` и Poetry согласованы с ним. `main.py` запускает порт 8080
+из `/app`; Helm монтирует конфигурацию в `/app/configs`.
+`deploy/Dockerfile` закомментирован и не используется.
+Пакеты для будущих pipeline в Dockerfile закомментированы до их подключения.
+
+Spark обеспечивает одинаковые схемы входных parquet. `partition_report_dt`
+в S3 остаётся обычной колонкой, хотя исходная Hadoop-таблица партиционирована по ней.
+Отсутствующий входной шард завершается FAILED: входных данных нет.

@@ -7,4 +7,4 @@ spec:
     app: fmcd-inference
   ports:
     - port: {{ .Values.service.port }}
-      targetPort: {{ .Values.service.port }}
+      targetPort: 8080

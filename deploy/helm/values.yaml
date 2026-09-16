@@ -20,7 +20,7 @@ nodeSelector:
   nvidia.com/gpu.product: H100
 
 service:
-  port: 8000
+  port: 8080
 
 # Реальные значения S3 передаются через env (см. templates/deployment.yaml):
 # несекретные - напрямую из values, секретные - из existingSecretName.

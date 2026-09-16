@@ -10,16 +10,16 @@
 Дополнительный HTTP provider не нужен: оператор использует стандартную библиотеку Python.
 
 ```python
-from airflow_operators.model_inference import ModelInferenceOperator
+from airflow_operators.gpu_model_inference_operator import GPUModelInferenceOperator
 
-infer = ModelInferenceOperator(
+infer = GPUModelInferenceOperator(
     task_id="infer",
     service_url="http://fmcd-inference:8080",
     s3_input_prefix="s3://input-bucket/credit_cards",
     s3_output_prefix="s3://output-bucket/credit_cards",
-    model_name="credit_cards",
-    partition_by="shard_id",
-    n_shards=8,
+    model_name="fmcd_credit_cards",
+    shard_id_column="shard_id",
+    num_shards=8,
     poke_interval=60,
     timeout=24 * 60 * 60,
     request_timeout=30,
@@ -29,9 +29,11 @@ infer = ModelInferenceOperator(
 prepare_data >> infer >> load_results_to_hadoop
 ```
 
-Без шардирования опустите оба параметра `partition_by` и `n_shards`.
+Без шардирования опустите оба параметра `shard_id_column` и `num_shards`.
 При шардировании вход и выход получают подпапки `shard_id=0` ... `shard_id=7`.
 Каждый входной префикс должен содержать parquet с необходимыми колонками модели.
+Отсутствующий шард завершается FAILED: входных данных нет.
+`partition_report_dt` в S3 является обычной колонкой, не Hive-партицией.
 Все шарды должны быть полностью записаны до запуска; оператор не ищет партиции
 в S3. Сервис не требует входного `_SUCCESS` внутри каждого шарда.
 

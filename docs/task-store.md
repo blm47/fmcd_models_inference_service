@@ -22,7 +22,7 @@ task_store:
 | POSTGRES_LOGIN | postgres.existingSecretName, ключ login | Пользователь |
 | POSTGRES_PASSWORD | postgres.existingSecretName, ключ password | Пароль |
 | POSTGRES_SCHEMA | postgres.schema | Схема |
-| POSTGRES_TABLE_NAME | postgres.tableName | Таблица |
+| POSTGRES_TASKSTORE_TABLE_NAME | postgres.tableName | Таблица |
 | POSTGRES_SSLMODE | postgres.sslmode | Режим libpq TLS; Helm: require, без ENV: prefer |
 
 Для `verify-full` доверенный CA настраивается стандартным `PGSSLROOTCERT` и
@@ -37,7 +37,7 @@ DDL: [001_create_task_store.sql](../migrations/001_create_task_store.sql).
 Время хранится в Unix seconds, как в JSON API и S3. Есть индексы незавершённых
 задач, уникальность ключа идемпотентности и единственного расчёта процесса.
 
-После задания `POSTGRES_SCHEMA` и `POSTGRES_TABLE_NAME` подготовьте SQL:
+После задания `POSTGRES_SCHEMA` и `POSTGRES_TASKSTORE_TABLE_NAME` подготовьте SQL:
 
 ```sh
 python scripts/migrate_task_store.py > task_store.sql

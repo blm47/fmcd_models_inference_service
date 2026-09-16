@@ -4,7 +4,7 @@ flowchart TB
     OUT[("Результаты parquet S3")]
     subgraph AF["Airflow — управление отдельным DAG каждой модели"]
         E["hadoop_2_S3"]
-        OP["ModelInferenceOperator<br/>Запуск и ожидание расчёта"]
+        OP["GPUModelInferenceOperator<br/>Запуск и ожидание расчёта"]
         R["S3_2_Hadoop после DONE"]
         E --> OP --> R
     end

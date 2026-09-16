@@ -15,8 +15,8 @@ INVEST пока заглушка. Метрики этапов заменены �
 ТЗ имеет приоритет над первоначальным предложением startup-загрузки.
 Разбор прототипа: [FMCD_INVEST](fmcd-invest-review.md).
 
-Проблема: текущие loader, ModelBundle, валидация входов и worker рассчитаны на
-один формат FMCD. FMCD_INVEST требует CatBoost, собственного preprocessing,
+Исходная проблема до MODEL-001: loader, валидация входов и worker были рассчитаны на
+один формат FMCD. Общий интерфейс уже реализован; остаётся подключить INVEST. FMCD_INVEST требует CatBoost, собственного preprocessing,
 нейросетевого stacking и других выходных колонок.
 
 Объём POC:

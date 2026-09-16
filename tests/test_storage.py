@@ -1,4 +1,6 @@
-"""Проверки parquet и _SUCCESS на файловой системе в памяти, без доступа к S3."""
+"""
+Проверки parquet и _SUCCESS на файловой системе в памяти, без доступа к S3.
+"""
 
 import unittest
 import uuid
@@ -45,3 +47,25 @@ class StorageTests(unittest.TestCase):
 
     def test_empty_output_is_accepted(self):
         self.assertFalse(self.client.prefix_has_results(f"s3://{self.prefix}"))
+
+    def test_arrow_schema_change_blocks_write_and_success(self):
+        for first, second in (([None], ["value"]), (["value"], [1])):
+            with self.subTest(first=first, second=second):
+                prefix = f"{self.prefix}/{uuid.uuid4().hex}"
+                writer = ParquetPrefixWriter(self.fs, prefix)
+                writer.write_chunk(pd.DataFrame({"value": pd.Series(first, dtype=object)}))
+                with self.assertRaisesRegex(ValueError, "Схема Parquet"):
+                    writer.write_chunk(pd.DataFrame({"value": pd.Series(second, dtype=object)}))
+                self.assertFalse(self.fs.exists(f"{prefix}/part-00001.parquet"))
+                with self.assertRaises(RuntimeError):
+                    writer.close()
+                self.assertFalse(self.fs.exists(f"{prefix}/_SUCCESS"))
+
+    def test_explicit_nullable_dtype_has_stable_arrow_schema(self):
+        writer = ParquetPrefixWriter(self.fs, self.prefix)
+        for values in ([None], [1.0]):
+            writer.write_chunk(pd.DataFrame({"value": pd.Series(values, dtype="Float64")}))
+        writer.close()
+        chunks = list(self.client.iter_chunks(f"/{self.prefix}", 10))
+        self.assertEqual(sum(len(chunk) for chunk in chunks), 2)
+        self.assertTrue(self.fs.exists(f"{self.prefix}/_SUCCESS"))

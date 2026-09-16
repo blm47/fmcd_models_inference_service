@@ -3,15 +3,10 @@ from typing import Any
 
 def warn_on_oversized_row_groups(dataset, chunk_size: int, logger: Any) -> None:
     """
-    Диагностический проход ПЕРЕД чтением через dataset.to_batches().
-    Проходит по каждому парт-файлу датасета и проверяет его
-    row group'ы через footer-метаданные.
-    Если у фрагмента ровно 1 row group и строк в нём больше chunk_size -
-    это тревожный признак: to_batches() будет вынужден продекодировать
-    этот row group ЦЕЛИКОМ в память перед тем, как отдать из него хоть
-    один батч, независимо от значения chunk_size. Явно логируем warn
-    с именем файла и точным размером, чтобы при повторном OOM не искать
-    причину заново, а сразу понимать, что виноват.
+    Проверяет размеры row groups по footer-метаданным до чтения.
+    Большие row groups могут увеличивать память на декодирование и prefetch.
+    chunk_size ограничивает размер выдаваемого батча, но не общий пик RAM;
+    фактический расход зависит от схемы, кодирования и настроек PyArrow.
     """
     for fragment in dataset.get_fragments():
         num_row_groups = fragment.num_row_groups
@@ -23,9 +18,8 @@ def warn_on_oversized_row_groups(dataset, chunk_size: int, logger: Any) -> None:
                 logger.warn(
                     f"Файл {fragment.path}: содержит ВСЕГО 1 row group на {rg_rows} строк "
                     f"(> chunk_size={chunk_size}), объём {rg_bytes / 1e6:.1f} MB. "
-                    "dataset.to_batches() будет декодировать этот row group ЦЕЛИКОМ в память "
-                    "перед выдачей первого батча из него, независимо от chunk_size. "
-                    "Риск OOM пропорционален размеру файла."
+                    "Размер батча не ограничивает общий пик памяти reader; "
+                    "проверьте расход RAM на декодирование и prefetch."
                 )
 
         else:
@@ -37,6 +31,6 @@ def warn_on_oversized_row_groups(dataset, chunk_size: int, logger: Any) -> None:
                     logger.warn(
                         f"Файл {fragment.path}: row group {rg_idx}/{num_row_groups} "
                         f"содержит {rg_meta.num_rows} строк (> chunk_size={chunk_size}), "
-                        f"объём {rg_meta.total_byte_size / 1e6:.1f} MB — будет "
-                        "декодирован целиком за один внутренний проход."
+                        f"объём {rg_meta.total_byte_size / 1e6:.1f} MB — "
+                        "возможен повышенный расход памяти reader."
                     )

@@ -1,4 +1,6 @@
-"""Объекты из lifespan передаются в API без повторной инициализации."""
+"""
+Объекты из lifespan передаются в API без повторной инициализации.
+"""
 
 from fastapi import Request
 
@@ -15,8 +17,9 @@ def get_task_store(request: Request):
     return request.app.state.task_store
 
 
-def get_s3_client(request: Request):
-    return request.app.state.s3_client
+# Не используется после переноса чтения S3 из API в worker.
+# def get_s3_client(request: Request):
+#     return request.app.state.s3_client
 
 
 def get_logger(request: Request):

@@ -24,12 +24,12 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
-            - containerPort: {{ .Values.service.port }}
+            - containerPort: 8080
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: config
-              mountPath: /srv/app/configs
+              mountPath: /app/configs
           env:
             - name: POD_NAME
               valueFrom:
@@ -63,7 +63,7 @@ spec:
               value: {{ required "Передайте postgres.url" .Values.postgres.url | quote }}
             - name: POSTGRES_SCHEMA
               value: {{ required "Передайте postgres.schema" .Values.postgres.schema | quote }}
-            - name: POSTGRES_TABLE_NAME
+            - name: POSTGRES_TASKSTORE_TABLE_NAME
               value: {{ required "Передайте postgres.tableName" .Values.postgres.tableName | quote }}
             - name: POSTGRES_SSLMODE
               value: {{ .Values.postgres.sslmode | quote }}
@@ -81,14 +81,14 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz/liveness
-              port: {{ .Values.service.port }}
+              port: 8080
             initialDelaySeconds: 60
             periodSeconds: 30
             timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /healthz/readiness
-              port: {{ .Values.service.port }}
+              port: 8080
             initialDelaySeconds: 30
             periodSeconds: 15
             timeoutSeconds: {{ .Values.probes.readinessTimeoutSeconds }}

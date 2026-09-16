@@ -83,10 +83,10 @@ class InferenceOperatorTests(unittest.TestCase):
         self.assertEqual(len(requests), 3)
         self.assertTrue(all(payload["calc_utilization"] is True for payload in requests))
         with self.assertRaisesRegex(ValueError, "calc_utilization"):
-            self.operator(calc_utilization="False")
+            self.operator(calc_utilization=[])
 
-    def test_default_shard_column_is_used_when_count_is_provided(self):
-        operator = self.operator(num_shards=2)
+    def test_explicit_shard_column_is_used_when_count_is_provided(self):
+        operator = self.operator(shard_id_column="shard_id", num_shards=2)
         self.assertEqual(operator.shard_id_column, "shard_id")
         requests = operator._requests(self.context)
         self.assertEqual(
@@ -106,6 +106,20 @@ class InferenceOperatorTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.requests[0]["s3_input_path"], "s3://input/data")
         self.assertEqual(self.requests[0]["s3_output_path"], "s3://output/data")
+
+    def test_default_arguments_submit_one_request(self):
+        operator = self.operator()
+        self.assertIsNone(operator.shard_id_column)
+        self.assertEqual(len(operator._requests(self.context)), 1)
+
+    def test_utilization_template_is_validated_after_rendering(self):
+        operator = self.operator(calc_utilization="{{ params.calc_utilization }}")
+        for rendered, expected in (("False", False), ("true", True), (False, False)):
+            operator.calc_utilization = rendered
+            self.assertIs(operator._requests(self.context)[0]["calc_utilization"], expected)
+        operator.calc_utilization = "invalid"
+        with self.assertRaisesRegex(ValueError, "calc_utilization"):
+            operator._requests(self.context)
 
     def test_progress_is_logged_on_every_poll_and_100_is_not_done(self):
         operator = self.operator(shard_id_column=None)

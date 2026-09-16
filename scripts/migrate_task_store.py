@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Выполнить DDL вместо вывода")
     args = parser.parse_args()
     schema = required_env("POSTGRES_SCHEMA")
-    table_name = required_env("POSTGRES_TABLE_NAME")
+    table_name = required_env("POSTGRES_TASKSTORE_TABLE_NAME")
     statement = render_migration(schema, table_name)
     if not args.apply:
         print(statement.as_string())

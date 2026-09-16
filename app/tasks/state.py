@@ -180,6 +180,7 @@ class TaskStore:
         возвращает уже активную задачу этого владельца, если она есть.
         Если подходящих задач нет, возвращает None.
         """
+
         def claim(tasks):
             # Восстанавливаем результат захвата, если ответ предыдущей записи потерялся.
             owned = next(
@@ -278,6 +279,7 @@ class TaskStore:
         Сначала применяет таймаут; прогресс сохраняется только для активной задачи.
         Для чужой задачи вызывает PermissionError, для отсутствующей — KeyError.
         """
+
         def update(tasks):
             task = tasks[task_id]
             self._check_owner(task)
@@ -308,6 +310,7 @@ class TaskStore:
         при нефинальном статусе или переходе в DONE без FINALIZING.
         Для чужой задачи вызывает PermissionError, для отсутствующей — KeyError.
         """
+
         def update(tasks):
             task = tasks[task_id]
             self._check_owner(task)
@@ -331,6 +334,7 @@ class TaskStore:
         устанавливает флаг отмены и статус ABORTING без обновления heartbeat.
         Для FINALIZING вызывает QueueConflictError, финальные статусы не меняет.
         """
+
         def abort(tasks):
             task = tasks.get(task_id)
             if task is not None:
@@ -373,6 +377,7 @@ class TaskStore:
         запросе отмены, иначе в FINALIZING. Возвращает True только для FINALIZING.
         Для чужой задачи вызывает PermissionError, для отсутствующей — KeyError.
         """
+
         def prepare(tasks):
             task = tasks[task_id]
             self._check_owner(task)

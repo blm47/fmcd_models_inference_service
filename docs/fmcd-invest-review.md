@@ -145,7 +145,7 @@ f_pred, m_pred, c_pred, d_pred = 14 колонок. Промежуточные s
 ## Рекомендация по SQL и размещению этапов
 
 Первый вариант: Airflow → Hadoop SQL (отбор, типы, предусмотренные нули) → Parquet
-в S3 → GPUModelInferenceOperator(model_name="FMCD_INVEST") → полный pipeline чанка
+в S3 → GPUModelInferenceOperator(model_name="fmcd_invest") → полный pipeline чанка
 в сервисе → выходной Parquet. Две ветки обрабатывают один и тот же чанк; распределять
 их по отдельным Airflow-задачам и делать промежуточную выгрузку пока не требуется.
 
@@ -183,32 +183,12 @@ preprocess + обе модели + postprocess на чанке, затем не�
 Число S3-шардов не определяет число исполнителей: текущий worker выполняет одну
 задачу за раз на под, несколько подов могут обрабатывать разные шарды.
 
-## Минимальный интерфейс модели
+## Текущий интерфейс модели
 
-Текущий ModelBundle, loader, validation и run_inference_on_chunk жёстко связаны
-с ProdSchema/FMCDModel и существующими формулами выходов. Один каталог уже поддержан
-через artifacts_dir, но произвольный pipeline новым экземпляром конфига не подключить.
-
-Предлагается небольшой BaseInferenceModel/Protocol:
-- load(artifacts_dir, options, logger) — однократная загрузка на под;
-- required_columns — входной контракт, включая ключи;
-- predict_chunk(frame, batch_size, check_shutdown) — полный pipeline и выходной DataFrame;
-- close() — опциональное освобождение ресурсов.
-
-Реализации: LegacyFMCDModel и FMCDInvestModel. Простой реестр backend → класс,
-конфигурация name/backend/artifacts_dir/options. В options — отдельные device,
-batch size и CPU threads для модели; нельзя полагаться только на нынешний глобальный device.
-Подкаталоги внутри artifacts/FMCD_INVEST допустимы: важно иметь один корень со всем комплектом.
-Новый тип pipeline требует нового класса и его регистрации; только заменой весов
-можно добавлять экземпляры уже реализованного типа, но не любую неизвестную архитектуру.
-
-Worker сохраняет чтение/запись S3, очередь, last_modified, отмену, progress/ETA и _SUCCESS.
-Модель не управляет Airflow и очередью. Начальный контракт — одна выходная строка
-на входную с сохранёнными ключами; другой контракт требует отдельного согласования.
-
-Это заимствует идею жизненного цикла initialize/execute/finalize из
-[Triton Python Backend](https://github.com/triton-inference-server/python_backend),
-но не требует Triton, dynamic batching, hot reload или универсального конструктора DAG.
+Историческое предложение startup-load заменено [ModelBundle](model-bundle-spec.md).
+Теперь один экземпляр создаётся на задачу: обязательные load, predict_batch и close.
+Device и размеры батчей задаются в ModelSpec, required_columns не включает ключи.
+Общая инфраструктура отделена от FMCD; INVEST остаётся заглушкой до получения артефактов.
 
 ## Что необходимо уточнить
 

@@ -5,3 +5,7 @@
 *.toml text eol=lf
 requirements.txt text eol=lf
 Dockerfile text eol=lf
+*.mmd text eol=lf
+.pylintrc text eol=lf
+.dockerignore text eol=lf
+requirements-test.txt text eol=lf

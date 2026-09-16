@@ -82,7 +82,7 @@ class ConfigTests(unittest.TestCase):
             "POSTGRES_LOGIN": "worker",
             "POSTGRES_PASSWORD": "secret",
             "POSTGRES_SCHEMA": "fmcd",
-            "POSTGRES_TABLE_NAME": "tasks",
+            "POSTGRES_TASKSTORE_TABLE_NAME": "tasks",
         }
         with patch("app.core.config.yaml.safe_load", return_value=raw):
             for key in postgres:

@@ -1,4 +1,6 @@
-"""Запуск одного процесса API и GPU worker."""
+"""
+Запуск одного процесса API и GPU worker.
+"""
 
 import uvicorn
 

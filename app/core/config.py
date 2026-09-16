@@ -156,7 +156,7 @@ def load_settings(config_path: str | Path = "configs/models.yaml") -> Settings:
             login=required_env("POSTGRES_LOGIN"),
             password=required_env("POSTGRES_PASSWORD"),
             schema=required_env("POSTGRES_SCHEMA"),
-            table_name=required_env("POSTGRES_TABLE_NAME"),
+            table_name=required_env("POSTGRES_TASKSTORE_TABLE_NAME"),
             sslmode=os.environ.get("POSTGRES_SSLMODE", "prefer"),
         )
     return Settings(

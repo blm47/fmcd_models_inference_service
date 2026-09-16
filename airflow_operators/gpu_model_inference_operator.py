@@ -1,4 +1,6 @@
-"""Запуск инференса и ожидание всех шардов в Airflow 2.6.3."""
+"""
+Запуск инференса и ожидание всех шардов в Airflow 2.6.3.
+"""
 
 from __future__ import annotations
 
@@ -47,13 +49,13 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         s3_input_prefix: str,
         s3_output_prefix: str,
         model_name: str,
-        shard_id_column: str | None = "shard_id",
+        shard_id_column: str | None = None,
         num_shards: int | None = None,
         poke_interval: float = 60,
         timeout: float = 86400,
         request_timeout: float = 30,
         verify_ssl: bool = False,
-        calc_utilization: bool = False,
+        calc_utilization: bool | str = False,
         **kwargs,
     ):
         """
@@ -62,7 +64,7 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         :param s3_output_prefix: Префикс результатов вида s3://bucket/path.
         :param model_name: Непустое имя модели для запуска инференса.
         :param shard_id_column: Имя колонки идентификатора шарда; задаётся вместе с num_shards.
-            По умолчанию "shard_id": запускается один расчёт без разбиения на шарды.
+            По умолчанию None: запускается один расчёт без разбиения на шарды.
         :param num_shards: Положительное целое число шардов; задаётся вместе с shard_id_column.
             К входному и выходному префиксам добавляется /shard_id_column=i,
             где i от 0 до num_shards - 1. По умолчанию None.
@@ -75,7 +77,8 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         :param verify_ssl: Проверять сертификат и имя HTTPS-сервиса, по умолчанию False.
             False отключает проверку для запуска, опроса и отмены инференса.
         :param calc_utilization: Считать утилизацию в памяти worker и вывести итог
-            в logger, по умолчанию False.
+            в logger, по умолчанию False. Допускается Jinja-шаблон; после рендеринга
+            ожидается bool или строка true/false/1/0.
         :param kwargs: Дополнительные параметры BaseSensorOperator, включая task_id.
             retries должен быть 0, mode — 'reschedule'; эти значения заданы
             по умолчанию. soft_fail и silent_fail не должны быть включены.
@@ -91,8 +94,8 @@ class GPUModelInferenceOperator(BaseSensorOperator):
             )
         if request_timeout <= 0:
             raise ValueError("request_timeout должен быть положительным")
-        if not isinstance(calc_utilization, bool):
-            raise ValueError("calc_utilization должен быть bool")
+        if not isinstance(calc_utilization, (bool, str)):
+            raise ValueError("calc_utilization должен быть bool или Jinja-шаблоном")
         if not isinstance(verify_ssl, bool):
             raise ValueError("verify_ssl должен быть bool")
         super().__init__(poke_interval=poke_interval, timeout=timeout, **kwargs)
@@ -108,7 +111,14 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         self._tasks = {}
 
     def _requests(self, context):
-        """Строит ключи по TI и попытке после обработки Jinja-шаблонов."""
+        """
+        Строит ключи по TI и попытке после обработки Jinja-шаблонов.
+        """
+        if isinstance(self.calc_utilization, str):
+            value = self.calc_utilization.strip().lower()
+            if value not in {"true", "false", "1", "0"}:
+                raise ValueError("calc_utilization после Jinja должен быть bool")
+            self.calc_utilization = value in {"true", "1"}
         if urlsplit(self.service_url).scheme not in {"http", "https"}:
             raise ValueError("service_url должен начинаться с http:// или https://")
         if not self.model_name:
@@ -145,7 +155,9 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         return requests
 
     def _http(self, method, path, payload=None):
-        """Повторяет временные HTTP-ошибки с тем же телом и ключом запроса."""
+        """
+        Повторяет временные HTTP-ошибки с тем же телом и ключом запроса.
+        """
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         tls_context = ssl.create_default_context()
         if not self.verify_ssl:
@@ -178,7 +190,9 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         raise AirflowException(f"{method} {path}: {error}")
 
     def _abort_remaining(self):
-        """Отправляет отмену всем известным незавершённым задачам, даже при ошибках API."""
+        """
+        Отправляет отмену всем известным незавершённым задачам, даже при ошибках API.
+        """
         for task_id, task in self._tasks.items():
             if task.get("status") in {"DONE", "FAILED", "ABORTED"}:
                 continue
@@ -200,7 +214,9 @@ class GPUModelInferenceOperator(BaseSensorOperator):
             raise
 
     def poke(self, context):
-        """Восстанавливает заявки по ключам и проверяет завершение всех шардов."""
+        """
+        Восстанавливает заявки по ключам и проверяет завершение всех шардов.
+        """
         errors = []
         for payload in self._requests(context):
             try:
@@ -246,5 +262,7 @@ class GPUModelInferenceOperator(BaseSensorOperator):
         return False
 
     def on_kill(self):
-        """Запрашивает отмену при штатном завершении активного процесса Airflow."""
+        """
+        Запрашивает отмену при штатном завершении активного процесса Airflow.
+        """
         self._abort_remaining()

@@ -23,12 +23,21 @@ class ParquetPrefixWriter:
     fs: s3fs.S3FileSystem
     output_prefix: str
     _part_idx: int = field(default=0, init=False)
+    _schema: pa.Schema | None = field(default=None, init=False)
+    _failed: bool = field(default=False, init=False)
 
     def write_chunk(self, df_chunk: pd.DataFrame) -> None:
         """
         Пишет один чанк как отдельный парт-файл под output_prefix.
         """
+        if self._failed:
+            raise RuntimeError("Writer остановлен после ошибки схемы результата")
         table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+        schema = table.schema.remove_metadata()
+        if self._schema is not None and not self._schema.equals(schema):
+            self._failed = True
+            raise ValueError("Схема Parquet результата изменилась между чанками")
+        self._schema = schema
         part_path = f"{self.output_prefix}/part-{self._part_idx:05d}.parquet"
         with self.fs.open(part_path, "wb") as sink:
             pq.write_table(table, sink)
@@ -38,6 +47,8 @@ class ParquetPrefixWriter:
         """
         Кладёт пустой _SUCCESS маркер - признак полностью завершённой записи.
         """
+        if self._failed:
+            raise RuntimeError("Нельзя публиковать _SUCCESS после ошибки схемы результата")
         success_path = f"{self.output_prefix}/{_SUCCESS_MARKER}"
         with self.fs.open(success_path, "wb") as sink:
             sink.write(b"")
@@ -94,10 +105,9 @@ class S3Client:
 
     def iter_chunks(self, s3_prefix: str, chunk_size: int):
         """
-        Генератор df_chunk по chunk_size строк. pyarrow.dataset.to_batches
-        сам "склеивает" record batches из разных парт-файлов Spark в батчи
-        нужного размера, поэтому границы chunk_size не привязаны к границам
-        исходных парт-файлов.
+        Возвращает чанки размером не больше chunk_size строк.
+        Границы файлов и row groups могут давать меньшие чанки;
+        reader не склеивает остатки разных файлов до полного chunk_size.
         """
         dataset = self.open_dataset(s3_prefix)
 

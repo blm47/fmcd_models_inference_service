@@ -1,11 +1,15 @@
-"""Передача сигнала остановки worker без подмены штатного shutdown Uvicorn."""
+"""
+Передача сигнала остановки worker без подмены штатного shutdown Uvicorn.
+"""
 
 import signal
 import threading
 
 
 def install_shutdown_handlers(stop, logger):
-    """Оборачивает handlers Uvicorn, чтобы worker увидел SIGTERM до ожидания HTTP."""
+    """
+    Оборачивает handlers Uvicorn, чтобы worker увидел SIGTERM до ожидания HTTP.
+    """
     if threading.current_thread() is not threading.main_thread():
         return {}
     previous = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
