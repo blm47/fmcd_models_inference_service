@@ -5,7 +5,7 @@
 Раскройте метод или DTO для просмотра. Примеры запросов нужно адаптировать
 к своим бакетам и модели. Отправка запросов доступна в `/docs` сервиса.
 
-Асинхронный GPU-инференс над parquet в S3. Любой под принимает заявки, свободный worker забирает их из общей очереди S3.
+Асинхронный GPU-инференс над parquet в S3. Любой под принимает заявки, свободный worker забирает их из общей очереди (S3 или PostgreSQL).
 
 **Airflow:** hadoop_2_S3 запускает Spark job → `POST /infer` → опрашивать `GET /tasks/{task_id}/status` → при `DONE` S3_2_Hadoop запускает Spark job. Parquet передаётся между хранилищами через Spark, не через Airflow.
 
@@ -43,6 +43,7 @@ Worker проверяет входные parquet, колонки, число с�
 
 ```json
 {
+  "calc_utilization": true,
   "idempotency_key": "fmcd_credit_cards/run-1/infer/attempt-1",
   "model_name": "fmcd_credit_cards",
   "s3_input_path": "s3://input-bucket/data/run-1",
@@ -59,7 +60,7 @@ Worker проверяет входные parquet, колонки, число с�
 | 404 | Модель не найдена в конфигурации | application/json: [ErrorResponse](#errorresponse) |
 | 409 | Конфликт ключа, занятый выходной префикс или полная очередь | application/json: [ErrorResponse](#errorresponse) |
 | 422 | Некорректные параметры запроса или пути S3 | application/json: [ErrorResponse](#errorresponse) |
-| 503 | S3 недоступен. Повторите запрос с прежним ключом | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Хранилище очереди недоступно. Повторите запрос с прежним ключом | application/json: [ErrorResponse](#errorresponse) |
 
 </details>
 
@@ -70,7 +71,7 @@ Worker проверяет входные parquet, колонки, число с�
 
 Airflow опрашивает этот метод до DONE, FAILED или ABORTED.
 Результат готов к чтению только при DONE. ETA является оценкой, а не дедлайном.
-`executor_alive` вычисляется по heartbeat и не подтверждает физическую
+`executor_alive` вычисляется по last_modified и не подтверждает физическую
 остановку процесса при значении false.
 
 **Parameters**
@@ -84,7 +85,7 @@ Airflow опрашивает этот метод до DONE, FAILED или ABORTE
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 200 | Successful Response | application/json: [TaskStatusResponse](#taskstatusresponse) |
-| 503 | Не удалось прочитать или обновить очередь S3 | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Не удалось прочитать или обновить очередь | application/json: [ErrorResponse](#errorresponse) |
 | 404 | Задача не найдена или удалена из истории | application/json: [ErrorResponse](#errorresponse) |
 | 422 | Validation Error | application/json: [HTTPValidationError](#httpvalidationerror) |
 
@@ -110,7 +111,7 @@ Worker завершает текущую операцию и подтвержд�
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 200 | Successful Response | application/json: [TaskAbortResponse](#taskabortresponse) |
-| 503 | Не удалось прочитать или обновить очередь S3 | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Не удалось прочитать или обновить очередь | application/json: [ErrorResponse](#errorresponse) |
 | 404 | Задача не найдена | application/json: [ErrorResponse](#errorresponse) |
 | 409 | Задача FINALIZING уже публикует результат | application/json: [ErrorResponse](#errorresponse) |
 | 422 | Validation Error | application/json: [HTTPValidationError](#httpvalidationerror) |
@@ -120,7 +121,7 @@ Worker завершает текущую операцию и подтвержд�
 <details>
 <summary>GET /tasks/active — Получить все незавершённые задачи</summary>
 
-Все незавершённые задачи, включая очередь и потерявших heartbeat исполнителей.
+Все незавершённые задачи, включая очередь и переставших обновляться исполнителей.
 
 **Parameters**
 
@@ -131,14 +132,17 @@ Worker завершает текущую операцию и подтвержд�
 | HTTP | Описание | Тело ответа |
 | --- | --- | --- |
 | 200 | Successful Response | application/json: [ActiveTasksResponse](#activetasksresponse) |
-| 503 | Не удалось прочитать или обновить очередь S3 | application/json: [ErrorResponse](#errorresponse) |
+| 503 | Не удалось прочитать или обновить очередь | application/json: [ErrorResponse](#errorresponse) |
 
 </details>
 
 <details>
-<summary>GET /healthz/liveness — Проверить работу потоков пода</summary>
+<summary>GET /healthz/liveness — Проверить работу процесса и consumer</summary>
 
-200 при работающих consumer и monitor, иначе 503. Доступ к S3 не проверяет.
+Проверяет локальный consumer и сигнал остановки без обращения к хранилищу.
+
+Занятый GPU не считается сбоем. Ошибка S3 или PG не вызывает рестарт контейнера
+через liveness. Метод не занимает поток, ожидающий I/O очереди.
 
 **Parameters**
 
@@ -154,9 +158,14 @@ Worker завершает текущую операцию и подтвержд�
 </details>
 
 <details>
-<summary>GET /healthz/readiness — Проверить готовность пода</summary>
+<summary>GET /healthz/readiness — Проверить готовность пода и таймауты задач</summary>
 
-200 при работающих consumer и monitor, иначе 503. Доступ к S3 не проверяет.
+Проверяет consumer, доступность очереди и переводит просроченные задачи в FAILED.
+
+Запускает retention S3 по cleanup_interval_sec; PG не очищается.
+Этот вызов заменяет поток monitor_queue: вне Kubernetes ручку нужно опрашивать.
+При сбое хранилища или уже выполняющейся проверке возвращает 503.
+Проверка выполняется и на поде с занятым GPU, heartbeat работает независимо.
 
 **Parameters**
 
@@ -172,9 +181,14 @@ Worker завершает текущую операцию и подтвержд�
 </details>
 
 <details>
-<summary>GET /health — Проверить состояние сервиса</summary>
+<summary>GET /health — Проверить готовность сервиса и очередь</summary>
 
-200 при работающих consumer и monitor, иначе 503. Доступ к S3 не проверяет.
+Проверяет consumer, доступность очереди и переводит просроченные задачи в FAILED.
+
+Запускает retention S3 по cleanup_interval_sec; PG не очищается.
+Этот вызов заменяет поток monitor_queue: вне Kubernetes ручку нужно опрашивать.
+При сбое хранилища или уже выполняющейся проверке возвращает 503.
+Проверка выполняется и на поде с занятым GPU, heartbeat работает независимо.
 
 **Parameters**
 
@@ -207,7 +221,7 @@ Worker завершает текущую операцию и подтвержд�
 | status | [TaskStatus](#taskstatus) | да | Один из незавершённых статусов | — |
 | progress_pct | number | да | Сохранённый прогресс в процентах | — |
 | eta_seconds | number &#124; null | да | Оценка оставшихся секунд, если доступна | — |
-| executor_alive | boolean | да | Признак актуального heartbeat исполнителя | — |
+| executor_alive | boolean | да | Признак актуального last_modified исполнителя | — |
 
 </details>
 
@@ -262,6 +276,7 @@ Worker завершает текущую операцию и подтвержд�
 
 | Поле | Тип | Обязательно | Описание | Ограничения и примеры |
 | --- | --- | --- | --- | --- |
+| calc_utilization | boolean | нет | Считать утилизацию в памяти и вывести итог в logger; по умолчанию выключено | default: false; examples: [true] |
 | idempotency_key | string | да | Стабильный ключ одной попытки расчёта Airflow | maxLength: 256; minLength: 1; examples: [&quot;fmcd_credit_cards/run-1/infer/attempt-1&quot;] |
 | model_name | string | да | Имя модели из configs/models.yaml | minLength: 1; examples: [&quot;fmcd_credit_cards&quot;] |
 | s3_input_path | string | да | Входной префикс внутри S3_BUCKET_IN с подготовленными parquet | examples: [&quot;s3://input-bucket/data/run-1&quot;] |
@@ -321,42 +336,12 @@ Worker завершает текущую операцию и подтвержд�
 | progress_pct | number | да | Прогресс в процентах. 100 ещё не означает DONE | — |
 | eta_seconds | number &#124; null | да | Оценка оставшихся секунд, null если недоступна | — |
 | error | string &#124; null | да | Причина ошибки или таймаута, null при отсутствии | — |
-| heartbeat_at | number &#124; null | да | Последний heartbeat: Unix timestamp в секундах | — |
-| executor_alive | boolean | да | Признак актуального heartbeat, не проверка процесса | — |
+| last_modified | number | да | Последнее обновление задачи: Unix timestamp в секундах | — |
+| executor_alive | boolean | да | Признак актуального last_modified, не проверка процесса | — |
 | s3_output_path | string | да | Физический S3-префикс результата. Читать после DONE | — |
 | created_at | number | да | Создание задачи: Unix timestamp в секундах | — |
 | started_at | number &#124; null | да | Начало расчёта: Unix timestamp, null до старта | — |
 | finished_at | number &#124; null | да | Завершение: Unix timestamp, null до завершения | — |
-| metrics_util_cpu_min | number &#124; null | нет | cpu: min, %; null до первого измерения | — |
-| metrics_util_cpu_max | number &#124; null | нет | cpu: max, %; null до первого измерения | — |
-| metrics_util_cpu_mean | number &#124; null | нет | cpu: mean, %; null до первого измерения | — |
-| metrics_util_cpu_median | number &#124; null | нет | cpu: median, %; null до первого измерения | — |
-| metrics_util_cpu_samples | integer | нет | cpu: число успешных измерений | default: 0 |
-| metrics_util_ram_pct_min | number &#124; null | нет | ram_pct: min, %; null до первого измерения | — |
-| metrics_util_ram_pct_max | number &#124; null | нет | ram_pct: max, %; null до первого измерения | — |
-| metrics_util_ram_pct_mean | number &#124; null | нет | ram_pct: mean, %; null до первого измерения | — |
-| metrics_util_ram_pct_median | number &#124; null | нет | ram_pct: median, %; null до первого измерения | — |
-| metrics_util_ram_pct_samples | integer | нет | ram_pct: число успешных измерений | default: 0 |
-| metrics_util_ram_mb_min | number &#124; null | нет | ram_mb: min, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_ram_mb_max | number &#124; null | нет | ram_mb: max, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_ram_mb_mean | number &#124; null | нет | ram_mb: mean, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_ram_mb_median | number &#124; null | нет | ram_mb: median, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_ram_mb_samples | integer | нет | ram_mb: число успешных измерений | default: 0 |
-| metrics_util_gpu_min | number &#124; null | нет | gpu: min, %; null до первого измерения | — |
-| metrics_util_gpu_max | number &#124; null | нет | gpu: max, %; null до первого измерения | — |
-| metrics_util_gpu_mean | number &#124; null | нет | gpu: mean, %; null до первого измерения | — |
-| metrics_util_gpu_median | number &#124; null | нет | gpu: median, %; null до первого измерения | — |
-| metrics_util_gpu_samples | integer | нет | gpu: число успешных измерений | default: 0 |
-| metrics_util_gpu_ram_pct_min | number &#124; null | нет | gpu_ram_pct: min, %; null до первого измерения | — |
-| metrics_util_gpu_ram_pct_max | number &#124; null | нет | gpu_ram_pct: max, %; null до первого измерения | — |
-| metrics_util_gpu_ram_pct_mean | number &#124; null | нет | gpu_ram_pct: mean, %; null до первого измерения | — |
-| metrics_util_gpu_ram_pct_median | number &#124; null | нет | gpu_ram_pct: median, %; null до первого измерения | — |
-| metrics_util_gpu_ram_pct_samples | integer | нет | gpu_ram_pct: число успешных измерений | default: 0 |
-| metrics_util_gpu_ram_mb_min | number &#124; null | нет | gpu_ram_mb: min, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_gpu_ram_mb_max | number &#124; null | нет | gpu_ram_mb: max, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_gpu_ram_mb_mean | number &#124; null | нет | gpu_ram_mb: mean, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_gpu_ram_mb_median | number &#124; null | нет | gpu_ram_mb: median, МБ, 1 МБ = 1000000 bytes; null до первого измерения | — |
-| metrics_util_gpu_ram_mb_samples | integer | нет | gpu_ram_mb: число успешных измерений | default: 0 |
 
 </details>
 

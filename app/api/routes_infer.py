@@ -29,7 +29,9 @@ def validate_paths(request, settings) -> None:
         ):
             raise HTTPException(422, "Ожидается S3-префикс внутри настроенного бакета")
     system_path = f"s3://{settings.s3.bucket_out}/{settings.task_store.state_key}"
-    if prefixes_overlap(request.s3_output_path, system_path):
+    if settings.task_store.backend == "s3" and prefixes_overlap(
+        request.s3_output_path, system_path
+    ):
         raise HTTPException(422, "Выходной префикс пересекается с файлом очереди")
     if prefixes_overlap(request.s3_input_path, request.s3_output_path):
         raise HTTPException(422, "Входной и выходной префиксы не должны пересекаться")
@@ -53,7 +55,7 @@ def validate_paths(request, settings) -> None:
         },
         503: {
             "model": ErrorResponse,
-            "description": "S3 недоступен. Повторите запрос с прежним ключом",
+            "description": "Хранилище очереди недоступно. Повторите запрос с прежним ключом",
         },
     },
 )
@@ -83,7 +85,11 @@ def infer(
     request.s3_output_path = request.s3_output_path.rstrip("/")
     validate_paths(request, settings)
     existing = store.find_request(
-        request.idempotency_key, request.model_name, request.s3_input_path, request.s3_output_path
+        request.idempotency_key,
+        request.model_name,
+        request.s3_input_path,
+        request.s3_output_path,
+        request.calc_utilization,
     )
     if existing is not None:
         return existing
@@ -96,6 +102,7 @@ def infer(
         request.s3_input_path,
         request.s3_output_path,
         None,
+        calc_utilization=request.calc_utilization,
     )
     logger.info(
         f"Заявка {task.task_id} сохранена: модель={task.model_name}, статус={task.status.value}"

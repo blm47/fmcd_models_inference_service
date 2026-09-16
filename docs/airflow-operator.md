@@ -73,7 +73,7 @@ FINALIZING возвращает 409 и может завершиться DONE. �
 Автоматические retries отключены, даже если они заданы в default_args DAG.
 Для повторного расчёта:
 
-1. Проверьте завершение/остановку всех старых расчётов. Один FAILED по heartbeat
+1. Проверьте завершение/остановку всех старых расчётов. Один FAILED по таймауту
    не гарантирует остановку старого PUT, особенно при повторе в тот же S3-путь.
 2. Запустите вашу задачу очистки только выходного префикса таблицы, не всей очереди S3.
 3. Выполните Clear задачи инференса. Новая попытка создаст новые ключи для всех шардов.
@@ -87,3 +87,11 @@ FINALIZING возвращает 409 и может завершиться DONE. �
 Поведение reschedule и номера попытки сверено с исходниками
 [Airflow 2.6.3 BaseSensorOperator](https://airflow.apache.org/docs/apache-airflow/2.6.3/_modules/airflow/sensors/base.html)
 и [TaskInstance](https://airflow.apache.org/docs/apache-airflow/2.6.3/_modules/airflow/models/taskinstance.html).
+
+## Утилизация ресурсов
+
+`calc_utilization=False` по умолчанию. Передайте `calc_utilization=True` в
+`GPUModelInferenceOperator`, чтобы включить посекундные замеры для всех его шардов.
+Статистика считается в памяти пода-исполнителя; после close модели итог выводится
+в logger сервиса. В статусе задачи и TaskStore метрики не сохраняются.
+Подробности: [утилизация ресурсов](task-utilization.md).

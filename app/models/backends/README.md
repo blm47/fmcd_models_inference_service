@@ -12,8 +12,6 @@ backends/
       inference.py            # Вычисления батча
       pandas_to_fmcd.py       # Preprocessing
       fmcd/                  # Полный код моделистов: data/, model/ и т.д.
-      requirements.txt
-      requirements-container.txt
   fmcd_invest/
     runner.py                 # FMCDInvestRunner(ModelBundle), пока заглушка
     utils/                    # Все дополнительные классы и функции этого движка
@@ -25,6 +23,6 @@ backends/
 Код моделистов использует прямые импорты utils.fmcd, без aliases старого пакета.
 Веса и обученные статистики размещаются отдельно в artifacts_dir.
 
-requirements.txt содержит зависимости сверх общей инфраструктуры, а
-requirements-container.txt — сохранённые версии корпоративного образа.
+Зависимости задаются централизованно в корневом requirements.txt.
+Версии зависимостей корпоративного образа зафиксированы в корневом Dockerfile.
 Зависимости ещё не предоставленного кода моделистов нужно сверить при его переносе.

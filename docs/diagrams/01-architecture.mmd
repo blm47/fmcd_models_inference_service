@@ -18,14 +18,14 @@ flowchart TB
     OUT -->|"parquet"| JOBOUT --> H
     subgraph K["Kubernetes — сервис инференса"]
         API["API через балансировщик<br/>Заявки, статус, отмена"]
-        Q[("TaskStore в S3<br/>Статусы и metrics_util_*")]
+        Q[("TaskStore: S3 / PostgreSQL<br/>Статусы и прогресс")]
         P1["Под 1 — один worker"]
         P2["Под 2 — один worker"]
-        M["Монитор на каждом поде<br/>Проверка таймаутов"]
+        M["Kubelet вызывает readiness<br/>Проверка таймаутов в ручке"]
         API <--> Q
         Q -->|"Задачу берёт свободный под"| P1
         Q --> P2
-        P1 & P2 -->|"Прогресс, heartbeat, утилизация"| Q
+        P1 & P2 -->|"Прогресс и heartbeat"| Q
         M <--> Q
     end
     OP <-->|"HTTP: запуск и статус"| API

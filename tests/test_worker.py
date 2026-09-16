@@ -42,11 +42,9 @@ class WorkerTests(unittest.TestCase):
         self.cancel_event = threading.Event()
         self.logger = make_logger()
         self.remote_cancel = False
-        self.heartbeat_received = threading.Event()
         self.store = Mock()
         self.store.config.poll_interval_sec = 0.001
-        self.store.heartbeat_interval_sec = 0.01
-        self.store.heartbeat.side_effect = lambda task_id: self.heartbeat_received.set()
+        self.store.config.heartbeat_interval_sec = 0.01
         self.store.cancellation_requested.side_effect = lambda task_id: self.remote_cancel
         self.store.update_progress.side_effect = self._update_progress
         self.store.set_status.side_effect = self._set_status
@@ -71,18 +69,17 @@ class WorkerTests(unittest.TestCase):
         validation_patch.start()
         self.addCleanup(validation_patch.stop)
 
-        # Сохраняем реальные потоки, чтобы проверить остановку heartbeat при выходе worker.
-        thread_class = threading.Thread
         self.heartbeat_threads = []
+        thread_class = threading.Thread
 
         def make_thread(*args, **kwargs):
             thread = thread_class(*args, **kwargs)
             self.heartbeat_threads.append(thread)
             return thread
 
-        thread_patch = patch("app.tasks.worker.threading.Thread", side_effect=make_thread)
-        thread_patch.start()
-        self.addCleanup(thread_patch.stop)
+        patcher = patch("app.tasks.worker.threading.Thread", side_effect=make_thread)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _update_progress(self, task_id, processed_rows, inference_elapsed_sec):
         self.task.processed_rows = processed_rows
@@ -109,22 +106,51 @@ class WorkerTests(unittest.TestCase):
         )
 
     def assert_worker_stopped(self):
-        self.assertTrue(self.heartbeat_threads)
         self.assertTrue(all(not thread.is_alive() for thread in self.heartbeat_threads))
         if self.factory.called:
             self.bundle.close.assert_called_once_with()
-            self.store.start_utilization.assert_called_once_with(
-                self.task.task_id, self.spec.device
-            )
-            self.store.finish_utilization.assert_called_once_with(self.task.task_id)
 
-    def test_utilization_stops_after_model_close(self):
-        def finish(task_id):
-            self.bundle.close.assert_called_once_with()
-
-        self.store.finish_utilization.side_effect = finish
-        self.run_worker()
+    def test_utilization_is_not_started_by_default(self):
+        with patch("app.tasks.worker.UtilizationSampler") as sampler:
+            self.run_worker()
+        sampler.assert_not_called()
         self.assert_worker_stopped()
+
+    def test_utilization_stops_after_model_close_on_success_failure_and_cancel(self):
+        for outcome in ("success", "failure", "cancel", "close_failure"):
+            with self.subTest(outcome=outcome):
+                self.bundle.reset_mock()
+                self.task.calc_utilization = True
+                self.remote_cancel = False
+                self.cancel_event.clear()
+
+                def load(outcome=outcome):
+                    if outcome == "failure":
+                        raise RuntimeError("load failed")
+                    if outcome == "cancel":
+                        self.remote_cancel = True
+
+                self.bundle.load.side_effect = load
+                self.bundle.close.side_effect = (
+                    RuntimeError("close failed") if outcome == "close_failure" else None
+                )
+                with patch("app.tasks.worker.UtilizationSampler") as sampler:
+                    collector = sampler.return_value
+                    collector.snapshot.return_value = {"metrics_util_cpu_mean": 42}
+                    collector.stop.side_effect = lambda: self.bundle.close.assert_called_once()
+                    self.run_worker()
+                    sampler.assert_called_once_with(
+                        self.task.task_id, self.spec.device, self.logger
+                    )
+                    collector.start.assert_called_once()
+                    collector.stop.assert_called_once()
+                    self.assertTrue(
+                        any(
+                            '"metrics_util_cpu_mean": 42' in call.args[0]
+                            for call in self.logger.info.call_args_list
+                        )
+                    )
+                self.assert_worker_stopped()
 
     def test_partial_load_failure_closes_without_validating_input(self):
         self.bundle.load.side_effect = RuntimeError("partial load")
@@ -148,9 +174,8 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(self.cancel_event.is_set())
         self.assert_worker_stopped()
 
-    def test_heartbeat_during_load_and_cancel_before_validation(self):
+    def test_cancel_during_load_before_validation(self):
         def load():
-            self.assertTrue(self.heartbeat_received.wait(timeout=2))
             self.remote_cancel = True
 
         self.bundle.load.side_effect = load
@@ -383,16 +408,26 @@ class WorkerTests(unittest.TestCase):
         self.writer.close.assert_called_once_with()
         self.assert_worker_stopped()
 
-    def test_heartbeat_continues_while_inference_is_busy(self):
-        def infer(chunk, bundle, batch_size, checkpoint):
-            self.assertTrue(self.heartbeat_received.wait(timeout=2))
-            self.assertEqual(self.task.processed_rows, 0)
-            return chunk
+    def test_heartbeat_runs_during_load_and_stops_after_close(self):
+        received = threading.Event()
+        self.store.heartbeat.side_effect = lambda task_id: received.set() or True
 
-        self.infer.side_effect = infer
-        self.run_worker()
+        def load():
+            self.assertTrue(received.wait(timeout=2))
 
-        self.store.heartbeat.assert_called_with(self.task.task_id)
+        self.bundle.load.side_effect = load
+        real_thread = threading.Thread
+        threads = []
+
+        def make_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        with patch("app.tasks.worker.threading.Thread", side_effect=make_thread):
+            self.run_worker()
+        self.assertEqual(len(threads), 1)
+        self.assertFalse(threads[0].is_alive())
         self.assertEqual(self.task.status, TaskStatus.DONE)
         self.assert_worker_stopped()
 
@@ -422,7 +457,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.task.error, "output unavailable")
         self.assert_worker_stopped()
 
-    def test_failed_status_write_still_stops_heartbeat_and_releases_local_slot(self):
+    def test_failed_status_write_still_releases_local_slot(self):
         def fail(*args):
             self.cancel_event.set()
             raise RuntimeError("inference failed")
@@ -437,29 +472,26 @@ class WorkerTests(unittest.TestCase):
 
 
 class HeartbeatTests(unittest.TestCase):
-    def test_terminal_task_signals_worker_to_stop(self):
-        stop = Mock()
+    def test_terminal_task_signals_loss_and_stops_loop(self):
+        store, stop, logger = Mock(), Mock(), make_logger()
+        store.config.heartbeat_interval_sec = 30
         stop.wait.return_value = False
-        store = Mock()
         store.heartbeat.return_value = False
         lost = threading.Event()
-        _keep_heartbeat("task-1", store, stop, Mock(), lost)
+        _keep_heartbeat("task", store, stop, lost, logger)
         self.assertTrue(lost.is_set())
-        store.heartbeat.assert_called_once_with("task-1")
+        store.heartbeat.assert_called_once_with("task")
 
-    def test_temporary_storage_failure_is_retried_until_stop(self):
-        stop = Mock()
+    def test_storage_error_is_logged_and_retried(self):
+        store, stop, logger = Mock(), Mock(), make_logger()
+        store.config.heartbeat_interval_sec = 30
         stop.wait.side_effect = [False, False, True]
-        store = Mock()
-        store.heartbeat_interval_sec = 30
-        store.heartbeat.side_effect = [OSError("temporary S3 failure"), None]
-        logger = make_logger()
-
-        _keep_heartbeat("task-1", store, stop, logger)
-
+        store.heartbeat.side_effect = [OSError("temporary failure"), True]
+        lost = threading.Event()
+        _keep_heartbeat("task", store, stop, lost, logger)
+        self.assertFalse(lost.is_set())
         self.assertEqual(store.heartbeat.call_count, 2)
         logger.error.assert_called_once()
-        self.assertEqual(stop.wait.call_count, 3)
         stop.wait.assert_called_with(30)
 
 

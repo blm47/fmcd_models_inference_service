@@ -1,8 +1,8 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
--r app/models/backends/fmcd_cc_dc/utils/requirements.txt
--r app/models/backends/fmcd_invest/utils/requirements.txt
+torch>=2.2
+numpy>=1.26
 pandas>=2.2
 pyarrow>=15.0
 pyyaml>=6.0
@@ -11,3 +11,5 @@ boto3>=1.35.76
 dadm-functions==0.5.5
 psutil>=5.9
 nvidia-ml-py>=12.0
+psycopg[binary]>=3.2,<4
+psycopg-pool>=3.2,<4

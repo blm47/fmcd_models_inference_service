@@ -1,4 +1,6 @@
-"""S3 с атомарным CAS и управляемыми сбоями для проверки очереди."""
+"""
+S3 с атомарным CAS и управляемыми сбоями для проверки очереди.
+"""
 
 import hashlib
 import io
@@ -11,6 +13,7 @@ from botocore.exceptions import ClientError, ReadTimeoutError
 from logger_stub import make_logger
 
 from app.core.config import TaskStoreConfig
+from app.tasks.backends.s3 import S3TaskBackend
 from app.tasks.state import TaskStore
 
 
@@ -79,7 +82,9 @@ class FakeS3:
 
 
 def make_store(s3, **overrides):
-    return TaskStore(s3, "output", config(**overrides), make_logger())
+    settings = config(**overrides)
+    logger = make_logger()
+    return TaskStore(S3TaskBackend(s3, "output", settings, logger), settings, logger)
 
 
 def enqueue(store, key="request-1", output=None, model="cc"):

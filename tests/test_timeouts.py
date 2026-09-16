@@ -1,4 +1,6 @@
-"""Таймауты не возобновляют старые задачи и допускают новую попытку в тот же путь."""
+"""
+Таймауты не возобновляют старые задачи и допускают новую попытку в тот же путь.
+"""
 
 import json
 import signal
@@ -10,7 +12,6 @@ from fake_s3 import FakeS3, enqueue, make_store
 
 from app.core.shutdown import install_shutdown_handlers, restore_shutdown_handlers
 from app.tasks.state import TaskStatus
-from app.tasks.worker import monitor_queue
 
 
 class TimeoutTests(unittest.TestCase):
@@ -27,34 +28,24 @@ class TimeoutTests(unittest.TestCase):
         raw["tasks"][self.task.task_id][field] = 1
         self.s3.body = json.dumps(raw).encode()
 
-    def test_heartbeat_timeout_releases_same_output_for_new_attempt(self):
-        self.age("heartbeat_at")
+    def test_task_timeout_releases_same_output_for_new_attempt(self):
+        self.age("last_modified")
         self.monitor.fail_stale()
         failed = self.monitor.get(self.task.task_id)
         self.assertEqual(failed.status, TaskStatus.FAILED)
-        self.assertIn("heartbeat_timeout", failed.error)
+        self.assertIn("task_timeout", failed.error)
         retry = enqueue(self.monitor, "attempt-2", self.task.s3_output_path)
         self.assertEqual(retry.s3_output_path, self.task.s3_output_path)
         self.assertNotEqual(retry.task_id, self.task.task_id)
 
-    def test_progress_timeout_works_with_live_heartbeat(self):
-        self.age("updated_at")
-        self.monitor.fail_stale()
-        self.assertIn("progress_timeout", self.worker.get(self.task.task_id).error)
-
-    def test_late_heartbeat_cannot_revive_expired_task(self):
-        self.age("heartbeat_at")
-        self.assertFalse(self.worker.heartbeat(self.task.task_id))
-        self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
-
     def test_late_progress_does_not_revive_expired_task(self):
-        self.age("heartbeat_at")
+        self.age("last_modified")
         self.worker.update_progress(self.task.task_id, 9, 1)
         self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
 
     def test_late_completion_does_not_replace_timeout(self):
         self.worker.prepare_completion(self.task.task_id, 10, 1)
-        self.age("heartbeat_at")
+        self.age("last_modified")
         self.monitor.fail_stale()
         self.assertFalse(self.worker.set_status(self.task.task_id, TaskStatus.DONE))
         self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
@@ -65,7 +56,7 @@ class TimeoutTests(unittest.TestCase):
         for state in (TaskStatus.ABORTING, TaskStatus.FINALIZING):
             with self.subTest(state=state):
                 raw = json.loads(self.s3.body)
-                raw["tasks"][self.task.task_id].update(status=state, heartbeat_at=1)
+                raw["tasks"][self.task.task_id].update(status=state, last_modified=1)
                 self.s3.body = json.dumps(raw).encode()
                 self.monitor.fail_stale()
                 self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
@@ -76,19 +67,60 @@ class TimeoutTests(unittest.TestCase):
         waiting = enqueue(self.worker, "waiting")
         raw = json.loads(self.s3.body)
         for task in raw["tasks"].values():
-            task.update(heartbeat_at=1, updated_at=1)
+            task.update(last_modified=1)
         self.s3.body = json.dumps(raw).encode()
         writes = self.s3.writes
         self.monitor.fail_stale()
         self.assertEqual(self.s3.writes, writes)
         self.assertEqual(self.worker.get(waiting.task_id).status, TaskStatus.QUEUED)
 
-    def test_monitor_runs_without_free_gpu_worker(self):
-        self.age("heartbeat_at")
-        stop = Mock()
-        stop.is_set.side_effect = [False, True]
-        monitor_queue(self.monitor, stop, Mock())
+    def test_read_and_abort_do_not_extend_executor_lifetime(self):
+        self.age("last_modified")
+        before = self.worker.get(self.task.task_id).last_modified
+        self.monitor.get_all_active()
+        self.monitor.request_abort(self.task.task_id)
+        self.assertEqual(self.worker.get(self.task.task_id).last_modified, before)
+        self.monitor.fail_stale()
         self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
+
+    def test_owner_updates_last_modified_and_next_timeout_uses_it(self):
+        with patch("app.tasks.state.time.time", return_value=self.task.created_at + 60):
+            self.worker.set_total_rows(self.task.task_id, 10)
+            saved = self.worker.get(self.task.task_id).last_modified
+            self.assertEqual(saved, self.task.created_at + 60)
+        with patch(
+            "app.tasks.state.time.time",
+            return_value=saved + self.worker.config.task_timeout_sec - 1,
+        ):
+            self.monitor.fail_stale()
+            self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.RUNNING)
+        with patch(
+            "app.tasks.state.time.time", return_value=saved + self.worker.config.task_timeout_sec
+        ):
+            self.monitor.fail_stale()
+            self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
+
+    def test_late_input_validation_cannot_revive_expired_task(self):
+        self.age("last_modified")
+        self.assertFalse(self.worker.set_total_rows(self.task.task_id, 15))
+        self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
+
+    def test_heartbeat_extends_lifetime_without_changing_progress(self):
+        before = self.worker.get(self.task.task_id)
+        with patch("app.tasks.state.time.time", return_value=before.last_modified + 30):
+            self.assertTrue(self.worker.heartbeat(self.task.task_id))
+        after = self.worker.get(self.task.task_id)
+        self.assertEqual(after.last_modified, before.last_modified + 30)
+        self.assertEqual(after.processed_rows, before.processed_rows)
+
+    def test_late_heartbeat_does_not_revive_expired_task(self):
+        self.age("last_modified")
+        self.assertFalse(self.worker.heartbeat(self.task.task_id))
+        self.assertEqual(self.worker.get(self.task.task_id).status, TaskStatus.FAILED)
+
+    def test_heartbeat_from_other_owner_is_rejected(self):
+        with self.assertRaises(PermissionError):
+            self.monitor.heartbeat(self.task.task_id)
 
 
 class ShutdownSignalTests(unittest.TestCase):

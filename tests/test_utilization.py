@@ -2,6 +2,7 @@
 Посекундные замеры, точная статистика и сохранение утилизации через CAS.
 """
 
+import json
 import statistics
 import sys
 import types
@@ -11,7 +12,6 @@ from unittest.mock import Mock, patch
 from fake_s3 import FakeS3, make_store
 from logger_stub import make_logger
 
-from app.tasks.state import TaskStatus
 from app.tasks.utilization import ResourceProbe, UtilizationSampler, UtilizationStatistics
 
 
@@ -89,69 +89,15 @@ class UtilizationTests(unittest.TestCase):
 
 
 class UtilizationStoreTests(unittest.TestCase):
-    def setUp(self):
-        self.store = make_store(FakeS3())
-        self.store.initialize()
-        self.task = self.store.enqueue("key", "cc", "s3://in/data", "s3://out/data", None)
-        self.store.claim_next("pod", {"cc"})
-        self.collector = Mock()
-        self.stats = UtilizationStatistics()
-        self.collector.snapshot.side_effect = self.stats.snapshot
-        patcher = patch("app.tasks.state.UtilizationSampler", return_value=self.collector)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.store.start_utilization(self.task.task_id, "cpu")
-
-    def test_each_task_write_includes_latest_snapshot_without_resetting_timeouts(self):
-        before = self.store.get(self.task.task_id)
-        self.stats.add({"cpu": 10, "ram_mb": 100})
-        self.store.heartbeat(self.task.task_id)
-        first = self.store.get(self.task.task_id)
-        self.assertEqual(first.metrics_util_cpu_mean, 10)
-        self.assertEqual(first.updated_at, before.updated_at)
-        self.stats.add({"cpu": 30, "ram_mb": 300})
-        self.store.set_total_rows(self.task.task_id, 4)
-        self.assertEqual(self.store.get(self.task.task_id).metrics_util_ram_mb_median, 200)
-        self.store.update_progress(self.task.task_id, 4, 1)
-        self.store.prepare_completion(self.task.task_id, 4, 1)
-        self.store.set_status(self.task.task_id, TaskStatus.DONE)
-        terminal = self.store.get(self.task.task_id)
-        self.stats.add({"cpu": 100})
-        self.store.finish_utilization(self.task.task_id)
-        final = self.store.get(self.task.task_id)
-        self.assertEqual(final.status, TaskStatus.DONE)
-        self.assertEqual(final.finished_at, terminal.finished_at)
-        self.assertEqual(final.updated_at, terminal.updated_at)
-        self.assertEqual(final.metrics_util_cpu_max, 100)
-        self.assertEqual(final.metrics_util_cpu_samples, 3)
-        self.assertEqual(self.store._utilization, {})
-        self.collector.stop.assert_called_once()
-
-    def test_metrics_do_not_revive_task_failed_by_another_pod(self):
-        monitor = make_store(self.store.client)
-        self.store.set_status(self.task.task_id, TaskStatus.FAILED, error="original")
-        self.stats.add({"cpu": 42})
-        self.store.finish_utilization(self.task.task_id)
-        task = monitor.get(self.task.task_id)
-        self.assertEqual(task.status, TaskStatus.FAILED)
-        self.assertEqual(task.error, "original")
-        self.assertEqual(task.metrics_util_cpu_mean, 42)
-
-    def test_statistics_are_not_written_by_sampling_alone(self):
-        self.stats.add({"cpu": 12})
-        self.assertIsNone(self.store.get(self.task.task_id).metrics_util_cpu_mean)
-
-    def test_cas_retry_does_not_duplicate_samples(self):
-        self.stats.add({"cpu": 10})
-        self.store.client.fail_next = 412
-        self.store.heartbeat(self.task.task_id)
-        task = self.store.get(self.task.task_id)
-        self.assertEqual(task.metrics_util_cpu_samples, 1)
-        self.assertEqual(task.metrics_util_cpu_mean, 10)
-
-    def test_sampler_is_detached_even_if_final_write_fails(self):
-        with patch.object(self.store, "_mutate", side_effect=RuntimeError("S3 failed")):
-            with self.assertRaisesRegex(RuntimeError, "S3 failed"):
-                self.store.finish_utilization(self.task.task_id)
-        self.assertEqual(self.store._utilization, {})
-        self.collector.stop.assert_called_once()
+    def test_flag_survives_claim_and_metrics_are_not_serialized(self):
+        store = make_store(FakeS3())
+        store.initialize()
+        task = store.enqueue(
+            "key", "cc", "s3://in/data", "s3://out/data", None, calc_utilization=True
+        )
+        worker_store = make_store(store.backend.client)
+        claimed = worker_store.claim_next("pod", {"cc"})
+        self.assertTrue(claimed.calc_utilization)
+        worker_store.update_progress(task.task_id, 1, 0.5)
+        fields = json.loads(store.backend.client.body)["tasks"][task.task_id]
+        self.assertFalse(any(key.startswith("metrics_util_") for key in fields))

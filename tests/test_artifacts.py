@@ -32,10 +32,9 @@ class ArtifactsTests(unittest.TestCase):
         with (
             patch.dict("os.environ", ENVIRONMENT),
             patch("app.main.setup_logging", return_value=make_logger()),
-            patch("app.main.boto3.client"),
+            patch("app.main.create_task_backend"),
             patch("app.main.TaskStore"),
             patch("app.main.consume_queue"),
-            patch("app.main.monitor_queue"),
             patch("app.main.install_shutdown_handlers", return_value={}),
             patch("app.main.restore_shutdown_handlers"),
             patch("app.storage.s3_client.S3Client"),
@@ -80,7 +79,7 @@ class ArtifactsTests(unittest.TestCase):
             patch("app.main.setup_logging", return_value=logger),
             patch("app.main.load_settings", return_value=types.SimpleNamespace(models=models)),
             patch("app.main.download_model_artifacts", side_effect=download),
-            patch("app.main.boto3.client") as client,
+            patch("app.main.create_task_backend") as client,
             self.assertRaisesRegex(RuntimeError, "registry unavailable"),
         ):
             asyncio.run(start())
@@ -101,7 +100,7 @@ class InputMetadataTests(unittest.TestCase):
         self.assertTrue(self.store.set_total_rows(self.task.task_id, 15))
         after = self.store.get(self.task.task_id)
         self.assertEqual(after.total_rows, 15)
-        self.assertEqual(after.updated_at, before.updated_at)
+        self.assertGreaterEqual(after.last_modified, before.last_modified)
 
     def test_terminal_task_cannot_receive_row_count(self):
         self.store.claim_next("pod", {"cc"})
@@ -111,6 +110,6 @@ class InputMetadataTests(unittest.TestCase):
 
     def test_another_owner_cannot_change_row_count(self):
         self.store.claim_next("pod", {"cc"})
-        other = make_store(self.store.client)
+        other = make_store(self.store.backend.client)
         with self.assertRaises(PermissionError):
             other.set_total_rows(self.task.task_id, 15)

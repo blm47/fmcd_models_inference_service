@@ -1,4 +1,6 @@
-"""Контракт Airflow проверяется без загрузки моделей и GPU."""
+"""
+Контракт Airflow проверяется без загрузки моделей и GPU.
+"""
 
 import sys
 import types
@@ -10,39 +12,24 @@ from fastapi.testclient import TestClient
 from logger_stub import make_logger
 
 from app.main import app
+from app.tasks.backends.base import TaskStorageError
 from app.tasks.state import TaskStatus
 
 
 class ApiTests(unittest.TestCase):
-    def test_status_exposes_saved_utilization(self):
-        from app.tasks.utilization import UtilizationStatistics
-
+    def test_utilization_is_disabled_by_default(self):
         task_id = self.submit().json()["task_id"]
-        self.store.claim_next("pod", {"cc"})
-        stats = UtilizationStatistics()
-        stats.add(
-            {
-                "cpu": 150,
-                "ram_mb": 500,
-                "ram_pct": 25,
-                "gpu": 80,
-                "gpu_ram_mb": 1000,
-                "gpu_ram_pct": 50,
-            }
-        )
-        collector = Mock()
-        collector.snapshot.side_effect = stats.snapshot
-        with patch("app.tasks.state.UtilizationSampler", return_value=collector):
-            self.store.start_utilization(task_id, "cuda")
-            self.store.heartbeat(task_id)
-            self.store.finish_utilization(task_id)
-        response = self.client.get(f"/tasks/{task_id}/status")
-        self.assertEqual(response.status_code, 200)
-        result = response.json()
-        self.assertEqual(result["metrics_util_cpu_mean"], 150)
-        self.assertEqual(result["metrics_util_ram_mb_median"], 500)
-        self.assertEqual(result["metrics_util_gpu_ram_pct_max"], 50)
-        self.assertEqual(result["metrics_util_gpu_samples"], 1)
+        self.assertFalse(self.store.get(task_id).calc_utilization)
+        result = self.client.get(f"/tasks/{task_id}/status").json()
+        self.assertFalse(any(key.startswith("metrics_util_") for key in result))
+
+    def test_utilization_flag_is_persisted_and_part_of_idempotency(self):
+        response = self.submit(calc_utilization=True)
+        self.assertEqual(response.status_code, 202)
+        task_id = response.json()["task_id"]
+        self.assertTrue(self.store.get(task_id).calc_utilization)
+        self.assertEqual(self.submit(calc_utilization=True).json()["task_id"], task_id)
+        self.assertEqual(self.submit(calc_utilization=False).status_code, 409)
 
     def setUp(self):
         self.store = make_store(FakeS3())
@@ -105,7 +92,7 @@ class ApiTests(unittest.TestCase):
 
     def test_status_and_abort_from_other_pod(self):
         task_id = self.submit().json()["task_id"]
-        app.state.task_store = make_store(self.store.client)
+        app.state.task_store = make_store(self.store.backend.client)
         response = self.client.get(f"/tasks/{task_id}/status")
         self.assertEqual(response.json()["status"], "QUEUED")
         self.assertIsNone(response.json()["started_at"])
@@ -120,8 +107,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.submit(idempotency_key="other").status_code, 409)
 
     def test_storage_failure_does_not_confirm_acceptance(self):
-        self.store.client.fail_next = 403
+        self.store.backend.client.fail_next = 403
         self.assertEqual(self.submit().status_code, 503)
+
+    def test_postgres_storage_error_returns_503(self):
+        with patch.object(
+            self.store.backend, "get_by_key", side_effect=TaskStorageError("PG unavailable")
+        ):
+            response = self.submit()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("идемпотентности", response.json()["detail"])
+
+    def test_status_exposes_last_modified_without_heartbeat(self):
+        task_id = self.submit().json()["task_id"]
+        response = self.client.get(f"/tasks/{task_id}/status").json()
+        self.assertEqual(response["last_modified"], self.store.get(task_id).last_modified)
+        self.assertNotIn("heartbeat_at", response)
 
     def test_protects_queue_and_bucket_root(self):
         for path in (

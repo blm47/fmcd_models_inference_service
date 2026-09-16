@@ -7,7 +7,6 @@ from typing import Any
 
 from app.models.contracts import ModelBundle, ModelSpec
 
-# TODO Нужна инструкция по добавлению нового backend и новой модели в README.md
 BACKENDS = {
     "fmcd_cc_dc": "app.models.backends.fmcd_cc_dc.runner:FMCDCardsRunner",
     "fmcd_invest": "app.models.backends.fmcd_invest.runner:FMCDInvestRunner",

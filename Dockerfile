@@ -20,8 +20,15 @@ RUN chmod -R 777 /app
 RUN pip install --upgrade pip
 RUN pip install pandas==2.1.3
 RUN pip install transformers==4.16.2
-RUN pip install -r app/models/backends/fmcd_invest/utils/requirements-container.txt
-RUN pip install -r app/models/backends/fmcd_cc_dc/utils/requirements-container.txt
+RUN pip install catboost==1.2.2
+RUN pip install nvidia-nccl-cu12==2.27.3
+RUN pip install nvidia-cusparselt-cu12==0.7.1
+RUN pip install nvidia-cusparse-cu12==12.5.8.93
+RUN pip install nvidia-cusolver-cu12==11.7.3.90
+RUN pip install nvidia-cufft-cu12==11.3.3.83
+RUN pip install nvidia-cublas-cu12==12.8.4.1
+RUN pip install nvidia-cudnn-cu12==9.10.2.21
+RUN pip install torch==2.8.0
 RUN pip install traitlets==5.1.1
 RUN pip install pygments==2.11.2
 RUN pip install python-dateutil==2.8.2
@@ -44,6 +51,8 @@ RUN pip install autodynatrace==2.1.1
 RUN pip install dadm-functions==0.5.5
 RUN pip install psutil==5.9.8
 RUN pip install "nvidia-ml-py>=12.0"
+RUN pip install "psycopg[binary]>=3.2,<4"
+RUN pip install "psycopg-pool>=3.2,<4"
 
 EXPOSE 8080
 

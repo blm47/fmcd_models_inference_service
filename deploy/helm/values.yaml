@@ -32,3 +32,16 @@ s3:
   useSsl: true
   verifySsl: true
   existingSecretName: "fmcd-s3-credentials"
+
+# Используется при task_store.backend: pg в serviceConfig.
+postgres:
+  url: "postgresql://postgres.example.com:5432/fmcd"
+  schema: "fmcd"
+  tableName: "tasks"
+  sslmode: "require"
+  existingSecretName: "fmcd-postgres-credentials"
+  # Secret создаётся отдельно; ключи login и password.
+
+# Readiness может выполнить проверку таймаутов и cleanup с CAS retry.
+probes:
+  readinessTimeoutSeconds: 120

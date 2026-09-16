@@ -1,10 +1,10 @@
 """
-Настройки S3 читаются из ENV, настройки сервиса — только из YAML.
+Настройки подключений S3 и PostgreSQL читаются из ENV, настройки сервиса — только из YAML.
 """
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -46,6 +46,7 @@ class S3Config:
 
 @dataclass(frozen=True)
 class TaskStoreConfig:
+    backend: str
     state_key: str
     cas_timeout_sec: float
     cas_retry_interval_sec: float
@@ -53,8 +54,7 @@ class TaskStoreConfig:
     retention_months: int
     max_pending_tasks: int
     heartbeat_interval_sec: float
-    heartbeat_timeout_sec: float
-    progress_timeout_sec: float
+    task_timeout_sec: float
     cleanup_interval_sec: float
     progress_update_interval_sec: float
     connect_timeout_sec: float
@@ -68,10 +68,12 @@ class TaskStoreConfig:
                     raise ValueError(f"task_store.{name}: ожидается конечное положительное число")
         for name in ("retention_months", "max_pending_tasks"):
             positive_integer(f"task_store.{name}", getattr(self, name))
-        if self.heartbeat_timeout_sec <= self.heartbeat_interval_sec:
-            raise ValueError("heartbeat_timeout_sec должен быть больше heartbeat_interval_sec")
-        if self.progress_timeout_sec <= self.progress_update_interval_sec:
-            raise ValueError("progress_timeout_sec должен быть больше progress_update_interval_sec")
+        if self.backend not in ("s3", "pg"):
+            raise ValueError("task_store.backend: ожидается s3 или pg")
+        if self.task_timeout_sec <= self.heartbeat_interval_sec:
+            raise ValueError("task_timeout_sec должен быть больше heartbeat_interval_sec")
+        if self.task_timeout_sec <= self.progress_update_interval_sec:
+            raise ValueError("task_timeout_sec должен быть больше progress_update_interval_sec")
         if not isinstance(self.state_key, str) or not self.state_key.strip("/"):
             raise ValueError("task_store.state_key: ожидается непустой ключ S3")
         if self.state_key.startswith("/") or "://" in self.state_key:
@@ -81,10 +83,47 @@ class TaskStoreConfig:
 
 
 @dataclass(frozen=True)
+class PostgresConfig:
+    url: str
+    login: str
+    password: str = field(repr=False)
+    schema: str
+    table_name: str
+    sslmode: str = "prefer"
+
+    def __post_init__(self):
+        from urllib.parse import urlsplit
+
+        if self.sslmode not in (
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        ):
+            raise ValueError("POSTGRES_SSLMODE: неизвестный режим TLS")
+        parsed = urlsplit(self.url)
+        if (
+            parsed.scheme not in ("postgresql", "postgres")
+            or not parsed.hostname
+            or not parsed.path.strip("/")
+        ):
+            raise ValueError("POSTGRES_URL: ожидается postgresql://host:port/database")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("POSTGRES_URL: credentials и query передаются отдельно")
+        for name in ("schema", "table_name"):
+            value = getattr(self, name)
+            if not value or "\x00" in value or len(value.encode("utf-8")) > 63:
+                raise ValueError(f"POSTGRES_{name.upper()}: некорректный идентификатор")
+
+
+@dataclass(frozen=True)
 class Settings:
     models: list[ModelSpec]
     s3: S3Config
     task_store: TaskStoreConfig
+    postgres: PostgresConfig | None = None
 
 
 def load_settings(config_path: str | Path = "configs/models.yaml") -> Settings:
@@ -109,9 +148,21 @@ def load_settings(config_path: str | Path = "configs/models.yaml") -> Settings:
     if not models or len({model.name for model in models}) != len(models):
         raise ValueError("Список моделей должен быть непустым, имена — уникальными")
 
+    task_store = TaskStoreConfig(**raw["task_store"])
+    postgres = None
+    if task_store.backend == "pg":
+        postgres = PostgresConfig(
+            url=required_env("POSTGRES_URL"),
+            login=required_env("POSTGRES_LOGIN"),
+            password=required_env("POSTGRES_PASSWORD"),
+            schema=required_env("POSTGRES_SCHEMA"),
+            table_name=required_env("POSTGRES_TABLE_NAME"),
+            sslmode=os.environ.get("POSTGRES_SSLMODE", "prefer"),
+        )
     return Settings(
+        postgres=postgres,
         models=models,
-        task_store=TaskStoreConfig(**raw["task_store"]),
+        task_store=task_store,
         s3=S3Config(
             endpoint_url=required_env("S3_ENDPOINT_URL"),
             access_key=required_env("S3_ACCESS_KEY"),

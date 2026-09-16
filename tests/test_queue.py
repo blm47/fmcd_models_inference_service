@@ -1,4 +1,6 @@
-"""Проверки конкуренции, повторов запросов и безопасных переходов состояния."""
+"""
+Проверки конкуренции, повторов запросов и безопасных переходов состояния.
+"""
 
 import json
 import threading
@@ -73,7 +75,7 @@ class QueueTests(unittest.TestCase):
         enqueue(self.first)
         self.s3.lose_next_response = True
         with (
-            patch("app.tasks.state.time.monotonic", side_effect=[0, 31]),
+            patch("app.tasks.backends.s3.time.monotonic", side_effect=[0, 31]),
             self.assertRaises(TimeoutError),
         ):
             self.first.claim_next("pod1", {"cc"})
@@ -130,7 +132,6 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(QueueConflictError):
             self.second.request_abort(task.task_id)
         self.first.set_status(task.task_id, TaskStatus.DONE)
-        self.first.heartbeat(task.task_id)
         self.assertEqual(self.first.get(task.task_id).status, TaskStatus.DONE)
 
     def test_other_owner_cannot_change_progress(self):
@@ -143,7 +144,7 @@ class QueueTests(unittest.TestCase):
         task = enqueue(self.first)
         self.first.claim_next("pod1", {"cc"})
         raw = json.loads(self.s3.body)
-        raw["tasks"][task.task_id]["heartbeat_at"] = 1
+        raw["tasks"][task.task_id]["last_modified"] = 1
         self.s3.body = json.dumps(raw).encode()
         self.assertFalse(self.first.executor_alive(self.first.get(task.task_id)))
         self.assertIsNone(self.second.claim_next("pod2", {"cc"}))
@@ -156,7 +157,7 @@ class QueueTests(unittest.TestCase):
         pending = enqueue(self.first, "pending")
         raw = json.loads(self.s3.body)
         for record in raw["tasks"].values():
-            record["created_at"] = record["updated_at"] = record["finished_at"] = 1
+            record["created_at"] = record["last_modified"] = record["finished_at"] = 1
         self.s3.body = json.dumps(raw).encode()
         self.first.cleanup()
         self.assertIsNone(self.first.get(task.task_id))
@@ -181,20 +182,6 @@ class QueueTests(unittest.TestCase):
         self.second.initialize()
         self.assertEqual(self.s3.body, before)
         self.assertIsNotNone(self.second.get(task.task_id))
-
-    def test_legacy_state_is_read_without_resetting_timestamps(self):
-        task = enqueue(self.first)
-        raw = json.loads(self.s3.body)
-        del raw["revision"]
-        del raw["tasks"][task.task_id]["created_at"]
-        raw["tasks"][task.task_id]["started_at"] = 123
-        self.s3.body = json.dumps(raw).encode()
-        before = self.s3.body
-        self.second.initialize()
-        self.assertEqual(self.s3.body, before)
-        self.assertEqual(self.second.get(task.task_id).created_at, 123)
-        self.second.request_abort(task.task_id)
-        self.assertEqual(self.second.get(task.task_id).created_at, 123)
 
     def test_initialization_lost_response_is_reconciled(self):
         s3 = FakeS3()

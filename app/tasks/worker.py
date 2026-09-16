@@ -1,14 +1,15 @@
 """
-Фоновый инференс с отменой через S3 и отдельным heartbeat.
+Фоновый инференс с отменой и контролем активности через TaskStore.
 
 Отмена кооперативная: уже начатый чанк инференса завершается, после чего
 его результат не записывается, если поступила отмена. Перед записью _SUCCESS
 TaskStore фиксирует переход в FINALIZING или принимает последнюю отмену.
-Heartbeat показывает доступность исполнителя, а не движение прогресса.
+Heartbeat обновляет last_modified независимо от длительности этапов инференса.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import traceback
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from app.models.contracts import column_names
 from app.models.registry import create_bundle
 from app.tasks.state import TERMINAL_STATUSES, TaskState, TaskStatus, TaskStore
+from app.tasks.utilization import UtilizationSampler
 
 if TYPE_CHECKING:
     from app.core.config import Settings
@@ -24,28 +26,25 @@ if TYPE_CHECKING:
     from app.storage.s3_client import S3Client
 
 
-def _keep_heartbeat(
-    task_id: str,
-    store: TaskStore,
-    stop: threading.Event,
-    logger: Any,
-    lost: threading.Event | None = None,
-) -> None:
-    """Не блокирует heartbeat на долгом чтении, forward-pass или записи чанка."""
-    while not stop.wait(store.heartbeat_interval_sec):
+def _keep_heartbeat(task_id, store, stop, lost, logger) -> None:
+    """
+    Обновляет last_modified независимо от load, infer и записи результата.
+    """
+    while not stop.wait(store.config.heartbeat_interval_sec):
         try:
-            if store.heartbeat(task_id) is False:
-                if lost is not None:
-                    lost.set()
+            if not store.heartbeat(task_id):
+                lost.set()
                 return
         except Exception:
             logger.error(
-                (f"Задача {task_id}: не удалось обновить heartbeat") + "\n" + traceback.format_exc()
+                f"Задача {task_id}: не удалось обновить heartbeat\n" + traceback.format_exc()
             )
 
 
 def _save_status(store, task_id, status, error, stop, logger) -> bool:
-    """Сохраняет итог до подтверждения S3; повтор не запускает инференс заново."""
+    """
+    Сохраняет итог до подтверждения хранилища; повтор не запускает инференс заново.
+    """
     while True:
         try:
             if store.set_status(task_id, status, error=error) is False:
@@ -84,21 +83,21 @@ def run_task(
     inference_elapsed_sec = 0.0
     last_progress_flush = time.monotonic()
     success_written = False
-    heartbeat_stop = threading.Event()
-    heartbeat_thread = None
-    heartbeat_started = False
-    ownership_lost = threading.Event()
     bundle = None
     df_chunk = result_chunk = chunks = None
     output_dtypes = None
     load_complete = False
-    utilization_started = False
+    utilization = None
+    heartbeat_stop = threading.Event()
+    ownership_lost = threading.Event()
+    heartbeat_thread = None
+    heartbeat_started = False
 
     def check_shutdown() -> None:
         if stop.is_set():
             raise RuntimeError("pod_shutdown: под получил сигнал остановки")
         if ownership_lost.is_set():
-            raise RuntimeError("task_not_active: задача завершена по таймауту")
+            raise RuntimeError("task_not_active: задача завершена или просрочена")
 
     def cancelled() -> bool:
         check_shutdown()
@@ -116,7 +115,7 @@ def run_task(
     try:
         heartbeat_thread = threading.Thread(
             target=_keep_heartbeat,
-            args=(task_id, store, heartbeat_stop, logger, ownership_lost),
+            args=(task_id, store, heartbeat_stop, ownership_lost, logger),
             name=f"task-heartbeat-{task_id}",
             daemon=True,
         )
@@ -131,8 +130,9 @@ def run_task(
         from app.models.inference import run_inference_on_chunk
         from app.models.validation import validate_input_parquet
 
-        store.start_utilization(task_id, spec.device)
-        utilization_started = True
+        if task.calc_utilization:
+            utilization = UtilizationSampler(task_id, spec.device, logger)
+            utilization.start()
         bundle = create_bundle(spec, logger)
         logger.info(f"Задача {task_id}, модель={spec.name}: начало load")
         bundle.load()
@@ -208,7 +208,7 @@ def run_task(
         if processed_rows != task.total_rows:
             raise ValueError("Количество прочитанных строк изменилось после проверки входа")
 
-        # Проверка отмены и решение о завершении выполняются в одной мутации S3.
+        # Проверка отмены и решение о завершении выполняются в одной мутации очереди.
         # После FINALIZING API уже не принимает отмену: пишется маркер успеха.
         if not store.prepare_completion(task_id, processed_rows, inference_elapsed_sec):
             logger.info(f"Задача {task_id}: завершение отменено или задача просрочена")
@@ -257,21 +257,23 @@ def run_task(
                 )
             finally:
                 bundle = None
-        if utilization_started:
+        if utilization is not None:
             try:
-                store.finish_utilization(task_id)
+                utilization.stop()
+                logger.info(
+                    f"Задача {task_id}: итоговая утилизация "
+                    + json.dumps(utilization.snapshot(), ensure_ascii=False, allow_nan=False)
+                )
             except Exception:
                 logger.error(
-                    f"Задача {task_id}: не удалось сохранить итоговую утилизацию\n"
+                    f"Задача {task_id}: не удалось завершить сбор утилизации\n"
                     + traceback.format_exc()
                 )
         heartbeat_stop.set()
-        if heartbeat_started and heartbeat_thread is not None:
-            # Вызов S3 может ещё ожидать сетевой timeout. Поток daemon, а TaskStore
-            # не разрешает heartbeat менять терминальное состояние задачи.
+        if heartbeat_started:
             heartbeat_thread.join(timeout=1.0)
             if heartbeat_thread.is_alive():
-                logger.warn(f"Задача {task_id}: heartbeat ожидает завершения запроса S3")
+                logger.warn(f"Задача {task_id}: heartbeat ожидает завершения запроса к хранилищу")
         if not success_written:
             logger.warn(
                 f"Задача {task_id}: _SUCCESS не записан (частичная или прерванная загрузка)"
@@ -280,7 +282,8 @@ def run_task(
 
 def consume_queue(store, models, settings, s3_client, pod_id, stop, logger) -> None:
     """
-    Один поток последовательно выполняет задачи; занятый GPU не блокирует API.
+    Единственный и главный поток воркера
+    последовательно выполняет задачи; занятый GPU не блокирует API.
     """
     current_task = None
     while not stop.is_set():
@@ -312,21 +315,3 @@ def consume_queue(store, models, settings, s3_client, pod_id, stop, logger) -> N
                 + traceback.format_exc()
             )
         stop.wait(settings.task_store.poll_interval_sec)
-
-
-def monitor_queue(store, stop, logger) -> None:
-    """
-    Проверяет таймауты независимо от занятости GPU на этом поде.
-    """
-    next_cleanup = time.monotonic()
-    while not stop.is_set():
-        try:
-            store.fail_stale()
-            if time.monotonic() >= next_cleanup:
-                store.cleanup()
-                next_cleanup = time.monotonic() + store.config.cleanup_interval_sec
-        except Exception:
-            logger.error(
-                ("Не удалось проверить таймауты очереди S3") + "\n" + traceback.format_exc()
-            )
-        stop.wait(store.config.poll_interval_sec)

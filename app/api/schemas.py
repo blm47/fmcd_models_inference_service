@@ -8,6 +8,11 @@ from app.tasks.state import TaskStatus
 
 
 class InferRequest(BaseModel):
+    calc_utilization: bool = Field(
+        False,
+        description="Считать утилизацию в памяти и вывести итог в logger; по умолчанию выключено",
+        examples=[True],
+    )
     idempotency_key: str = Field(
         ...,
         min_length=1,
@@ -50,95 +55,16 @@ class TaskStatusResponse(BaseModel):
     progress_pct: float = Field(description="Прогресс в процентах. 100 ещё не означает DONE")
     eta_seconds: float | None = Field(description="Оценка оставшихся секунд, null если недоступна")
     error: str | None = Field(description="Причина ошибки или таймаута, null при отсутствии")
-    heartbeat_at: float | None = Field(description="Последний heartbeat: Unix timestamp в секундах")
-    executor_alive: bool = Field(description="Признак актуального heartbeat, не проверка процесса")
+    last_modified: float = Field(
+        description="Последнее обновление задачи: Unix timestamp в секундах"
+    )
+    executor_alive: bool = Field(
+        description="Признак актуального last_modified, не проверка процесса"
+    )
     s3_output_path: str = Field(description="Физический S3-префикс результата. Читать после DONE")
     created_at: float = Field(description="Создание задачи: Unix timestamp в секундах")
     started_at: float | None = Field(description="Начало расчёта: Unix timestamp, null до старта")
     finished_at: float | None = Field(description="Завершение: Unix timestamp, null до завершения")
-
-    metrics_util_cpu_min: float | None = Field(
-        None, description="cpu: min, %; null до первого измерения"
-    )
-    metrics_util_cpu_max: float | None = Field(
-        None, description="cpu: max, %; null до первого измерения"
-    )
-    metrics_util_cpu_mean: float | None = Field(
-        None, description="cpu: mean, %; null до первого измерения"
-    )
-    metrics_util_cpu_median: float | None = Field(
-        None, description="cpu: median, %; null до первого измерения"
-    )
-    metrics_util_cpu_samples: int = Field(0, description="cpu: число успешных измерений")
-    metrics_util_ram_pct_min: float | None = Field(
-        None, description="ram_pct: min, %; null до первого измерения"
-    )
-    metrics_util_ram_pct_max: float | None = Field(
-        None, description="ram_pct: max, %; null до первого измерения"
-    )
-    metrics_util_ram_pct_mean: float | None = Field(
-        None, description="ram_pct: mean, %; null до первого измерения"
-    )
-    metrics_util_ram_pct_median: float | None = Field(
-        None, description="ram_pct: median, %; null до первого измерения"
-    )
-    metrics_util_ram_pct_samples: int = Field(0, description="ram_pct: число успешных измерений")
-    metrics_util_ram_mb_min: float | None = Field(
-        None, description="ram_mb: min, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_ram_mb_max: float | None = Field(
-        None, description="ram_mb: max, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_ram_mb_mean: float | None = Field(
-        None, description="ram_mb: mean, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_ram_mb_median: float | None = Field(
-        None, description="ram_mb: median, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_ram_mb_samples: int = Field(0, description="ram_mb: число успешных измерений")
-    metrics_util_gpu_min: float | None = Field(
-        None, description="gpu: min, %; null до первого измерения"
-    )
-    metrics_util_gpu_max: float | None = Field(
-        None, description="gpu: max, %; null до первого измерения"
-    )
-    metrics_util_gpu_mean: float | None = Field(
-        None, description="gpu: mean, %; null до первого измерения"
-    )
-    metrics_util_gpu_median: float | None = Field(
-        None, description="gpu: median, %; null до первого измерения"
-    )
-    metrics_util_gpu_samples: int = Field(0, description="gpu: число успешных измерений")
-    metrics_util_gpu_ram_pct_min: float | None = Field(
-        None, description="gpu_ram_pct: min, %; null до первого измерения"
-    )
-    metrics_util_gpu_ram_pct_max: float | None = Field(
-        None, description="gpu_ram_pct: max, %; null до первого измерения"
-    )
-    metrics_util_gpu_ram_pct_mean: float | None = Field(
-        None, description="gpu_ram_pct: mean, %; null до первого измерения"
-    )
-    metrics_util_gpu_ram_pct_median: float | None = Field(
-        None, description="gpu_ram_pct: median, %; null до первого измерения"
-    )
-    metrics_util_gpu_ram_pct_samples: int = Field(
-        0, description="gpu_ram_pct: число успешных измерений"
-    )
-    metrics_util_gpu_ram_mb_min: float | None = Field(
-        None, description="gpu_ram_mb: min, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_gpu_ram_mb_max: float | None = Field(
-        None, description="gpu_ram_mb: max, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_gpu_ram_mb_mean: float | None = Field(
-        None, description="gpu_ram_mb: mean, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_gpu_ram_mb_median: float | None = Field(
-        None, description="gpu_ram_mb: median, МБ, 1 МБ = 1000000 bytes; null до первого измерения"
-    )
-    metrics_util_gpu_ram_mb_samples: int = Field(
-        0, description="gpu_ram_mb: число успешных измерений"
-    )
 
 
 class TaskAbortResponse(BaseModel):
@@ -153,7 +79,7 @@ class ActiveTaskSummary(BaseModel):
     status: TaskStatus = Field(description="Один из незавершённых статусов")
     progress_pct: float = Field(description="Сохранённый прогресс в процентах")
     eta_seconds: float | None = Field(description="Оценка оставшихся секунд, если доступна")
-    executor_alive: bool = Field(description="Признак актуального heartbeat исполнителя")
+    executor_alive: bool = Field(description="Признак актуального last_modified исполнителя")
 
 
 class ActiveTasksResponse(BaseModel):
