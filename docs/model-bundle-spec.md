@@ -32,11 +32,11 @@ models:
     parquet_read_chunk_size: 5000
 
   - name: "fmcd_invest"
-    id_cols: ["customer_mdm_id", "partition_report_dt"]
-    artifacts_dir: "artifacts/fmcd_invest"
+    id_cols: ["counterparty_id", "report_dt"]
+    artifacts_dir: "artefacts/fmcd_invest"
     backend: "fmcd_invest"
     device: "cuda"
-    infer_batch_size: 500
+    infer_batch_size: 4096
     parquet_read_chunk_size: 5000
 ```
 
@@ -252,11 +252,12 @@ INVEST сохраняет общий выход CatBoost F/C, две ветки 
 Подробная структура и размещение зависимостей: [backend](../app/models/backends/README.md).
 
 YAML содержит fmcd_credit_cards и fmcd_debet_cards с общим backend fmcd_cc_dc,
-а также fmcd_invest с отдельным backend. Для всех заданы пользовательские ключи
-customer_mdm_id/partition_report_dt, cuda, infer_batch_size=500 и
+а также fmcd_invest с отдельным backend. Для карт заданы ключи
+customer_mdm_id/partition_report_dt и infer_batch_size=500; для INVEST —
+counterparty_id/report_dt и infer_batch_size=4096. Для всех cuda и
 parquet_read_chunk_size=5000. Имя debet сохранено по предложению пользователя.
-INVEST пока явная заглушка: load завершает задачу FAILED с объяснением причины.
-Проверка эквивалентности ключей исходному notebook INVEST остаётся частью приёмки.
+INVEST реализован по скриншотам; вход — исходные признаки Parquet с уникальными
+парами ключей. Приёмка на настоящих весах остаётся отдельной проверкой.
 Препрод разворачивается с нуля. Совместимость со старой архитектурой не реализуется.
 
 Уточнение 2026-09-15: метрики этапов заменены посекундной статистикой ресурсов

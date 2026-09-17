@@ -13,7 +13,7 @@ backends/
       pandas_to_fmcd.py       # Preprocessing
       fmcd/                  # Полный код моделистов: data/, model/ и т.д.
   fmcd_invest/
-    runner.py                 # FMCDInvestRunner(ModelBundle), пока заглушка
+    runner.py                 # FMCDInvestRunner(ModelBundle)
     utils/                    # Все дополнительные классы и функции этого движка
 ```
 

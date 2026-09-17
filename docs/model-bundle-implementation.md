@@ -33,11 +33,13 @@
 | --- | --- | --- |
 | fmcd_credit_cards | fmcd_cc_dc | artifacts/credit_cards |
 | fmcd_debet_cards | fmcd_cc_dc | artifacts/debet_cards |
-| fmcd_invest | fmcd_invest | artifacts/fmcd_invest |
+| fmcd_invest | fmcd_invest | artefacts/fmcd_invest |
 
-Для всех: ключи customer_mdm_id/partition_report_dt, device=cuda,
-infer_batch_size=500, parquet_read_chunk_size=5000.
-INVEST пока заглушка с явным FAILED при load. Настоящий API registry — MODEL-002;
+Для карт: ключи customer_mdm_id/partition_report_dt, infer_batch_size=500.
+Для INVEST: counterparty_id/report_dt, infer_batch_size=4096.
+Для всех device=cuda, parquet_read_chunk_size=5000.
+INVEST реализован по скриншотам: [артефакты и вход](../app/models/backends/fmcd_invest/utils/README.md).
+Настоящий API registry — MODEL-002;
 startup-заглушка только логирует использование локальных файлов.
 
 ## Проверки и следующая точка оценки
@@ -66,7 +68,8 @@ load/close при успехе, ошибках и отмене, heartbeat во �
 серия CPU/GPU-задач и проверка статистики metrics_util_*.
 В окружении отсутствуют PyTorch и реальные комплекты моделей. Заглушки не
 доказывают численную эквивалентность настоящих весов или освобождение VRAM.
-Для реализации INVEST нужны полный SQL/ноутбук, артефакты, эталон и допуски.
+INVEST перенесён 2026-09-17; для приёмки нужны настоящие артефакты, эталон и допуски.
+SQL выполняется вне backend; вход INVEST — Parquet с исходными признаками.
 Переход со старой архитектуры не входит в работы: препрод разворачивается с нуля.
 
 ## Исходное поведение для регрессии

@@ -96,11 +96,11 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(first.required_columns, ())
         self.assertNotEqual(first.spec.artifacts_dir, second.spec.artifacts_dir)
 
-    def test_invest_stub_fails_explicitly_and_can_be_closed(self):
+    def test_invest_missing_artifact_fails_explicitly_and_can_be_closed(self):
         bundle = create_bundle(
             replace(make_spec(), name="fmcd_invest", backend="fmcd_invest"), make_logger()
         )
-        with self.assertRaisesRegex(NotImplementedError, "pipeline ещё не реализован"):
+        with self.assertRaisesRegex(FileNotFoundError, "Не найден артефакт INVEST"):
             bundle.load()
         bundle.close()
         bundle.close()

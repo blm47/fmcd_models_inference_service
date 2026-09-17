@@ -205,8 +205,10 @@ Startup хранит только ModelSpec. Worker после claim созда�
 останавливает под и readiness, сохраняя исходный статус задачи.
 
 В YAML настроены `fmcd_credit_cards` и `fmcd_debet_cards` с общим backend
-`fmcd_cc_dc`, а также `fmcd_invest`. INVEST пока является явной заглушкой:
-принятый расчёт завершится FAILED до реализации pipeline и предоставления артефактов.
+`fmcd_cc_dc`, а также `fmcd_invest`. INVEST выполняет CatBoost с калибровкой,
+preprocessing и нейросетевой stacking по исходным признакам из Parquet.
+Ключи INVEST — `counterparty_id`, `report_dt`; комплект файлов и порядок
+размещения описаны в [инструкции INVEST](app/models/backends/fmcd_invest/utils/README.md).
 `device`, `infer_batch_size`, `parquet_read_chunk_size` задаются на каждую модель.
 Для карт локальный комплект состоит из `model.pth`, `schema.json`,
 `calibrators.json`, `freq_encoding.parquet`; model.json не нужен.

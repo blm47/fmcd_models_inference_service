@@ -23,8 +23,8 @@ RUN pip install "pydantic>=1.10,<2"
 RUN pip install pandas==2.1.3
 # Пока не используется предоставленным кодом сервиса.
 # RUN pip install transformers==4.16.2
-# Пока не используется предоставленным кодом сервиса.
-# RUN pip install catboost==1.2.2
+RUN pip install "catboost>=1.2,<2"
+RUN pip install "openpyxl>=3.1,<4"
 RUN pip install nvidia-nccl-cu12==2.27.3
 RUN pip install nvidia-cusparselt-cu12==0.7.1
 RUN pip install nvidia-cusparse-cu12==12.5.8.93
